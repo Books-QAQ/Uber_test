@@ -3,6 +3,7 @@ package http
 import (
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"uber-test/backend/internal/api/http/handlers"
 	wsapi "uber-test/backend/internal/api/ws"
@@ -34,8 +35,8 @@ func NewRouter(deps RouterDeps) http.Handler {
 	})
 	mux.HandleFunc("/healthz", healthHandler.Get)
 	mux.HandleFunc("/api/v1/healthz", healthHandler.Get)
+	mux.HandleFunc("/api/v1/drivers/", routeDriverSubresources(driverHandler, orderHandler))
 	mux.HandleFunc("/api/v1/drivers/nearby", driverHandler.ListNearby)
-	mux.HandleFunc("/api/v1/drivers/", driverHandler.SetStatus)
 	mux.HandleFunc("/api/v1/drivers/locations", locationHandler.ListLatest)
 	mux.HandleFunc("/api/v1/orders", routeOrderCollection(orderHandler))
 	mux.HandleFunc("/api/v1/orders/", orderHandler.GetOrUpdateStatus)
@@ -55,6 +56,21 @@ func routeOrderCollection(handler *handlers.OrderHandler) http.HandlerFunc {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			_, _ = w.Write([]byte(`{"error":"method not allowed"}`))
+		}
+	}
+}
+
+func routeDriverSubresources(driverHandler *handlers.DriverHandler, orderHandler *handlers.OrderHandler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/status"):
+			driverHandler.SetStatus(w, r)
+		case strings.HasSuffix(r.URL.Path, "/current-order"):
+			orderHandler.GetCurrentByDriver(w, r)
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"route not found"}`))
 		}
 	}
 }

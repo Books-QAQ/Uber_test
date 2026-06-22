@@ -181,6 +181,79 @@ type nilBroadcaster struct{}
 
 func (nilBroadcaster) BroadcastJSON(any) {}
 
+func TestServiceRejectsSecondActiveOrderForSameDriver(t *testing.T) {
+	t.Parallel()
+
+	service := NewService(NewMemoryStore(), nil)
+
+	first, err := service.Create(context.Background(), model.CreateOrderInput{
+		PassengerID:    "passenger-a",
+		PickupLat:      31.1,
+		PickupLng:      121.1,
+		DestinationLat: 31.2,
+		DestinationLng: 121.2,
+	})
+	if err != nil {
+		t.Fatalf("create first order: %v", err)
+	}
+	second, err := service.Create(context.Background(), model.CreateOrderInput{
+		PassengerID:    "passenger-b",
+		PickupLat:      31.3,
+		PickupLng:      121.3,
+		DestinationLat: 31.4,
+		DestinationLng: 121.4,
+	})
+	if err != nil {
+		t.Fatalf("create second order: %v", err)
+	}
+
+	if _, err := service.UpdateStatus(context.Background(), first.ID, model.UpdateOrderStatusInput{
+		Status:   model.OrderStatusAccepted,
+		DriverID: "driver-busy",
+	}); err != nil {
+		t.Fatalf("accept first order: %v", err)
+	}
+
+	if _, err := service.UpdateStatus(context.Background(), second.ID, model.UpdateOrderStatusInput{
+		Status:   model.OrderStatusAccepted,
+		DriverID: "driver-busy",
+	}); err != ErrDriverBusy {
+		t.Fatalf("expected ErrDriverBusy, got %v", err)
+	}
+}
+
+func TestServiceGetCurrentByDriverID(t *testing.T) {
+	t.Parallel()
+
+	service := NewService(NewMemoryStore(), nil)
+
+	order, err := service.Create(context.Background(), model.CreateOrderInput{
+		PassengerID:    "passenger-current",
+		PickupLat:      30.1,
+		PickupLng:      120.1,
+		DestinationLat: 30.2,
+		DestinationLng: 120.2,
+	})
+	if err != nil {
+		t.Fatalf("create order: %v", err)
+	}
+
+	if _, err := service.UpdateStatus(context.Background(), order.ID, model.UpdateOrderStatusInput{
+		Status:   model.OrderStatusAccepted,
+		DriverID: "driver-current",
+	}); err != nil {
+		t.Fatalf("accept order: %v", err)
+	}
+
+	current, err := service.GetCurrentByDriverID(context.Background(), "driver-current")
+	if err != nil {
+		t.Fatalf("get current by driver: %v", err)
+	}
+	if current.ID != order.ID {
+		t.Fatalf("expected current order %s, got %s", order.ID, current.ID)
+	}
+}
+
 func mustAddrPort(value string) netip.AddrPort {
 	return netip.MustParseAddrPort(value)
 }

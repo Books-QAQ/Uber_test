@@ -62,6 +62,13 @@ func (s *Service) List(ctx context.Context) ([]model.Order, error) {
 	return s.store.List(ctx)
 }
 
+func (s *Service) GetCurrentByDriverID(ctx context.Context, driverID string) (model.Order, error) {
+	if driverID == "" {
+		return model.Order{}, fmt.Errorf("get current order: missing driver_id")
+	}
+	return s.store.FindActiveByDriverID(ctx, driverID)
+}
+
 func (s *Service) UpdateStatus(ctx context.Context, id string, input model.UpdateOrderStatusInput) (model.Order, error) {
 	order, err := s.store.GetByID(ctx, id)
 	if err != nil {
@@ -69,6 +76,9 @@ func (s *Service) UpdateStatus(ctx context.Context, id string, input model.Updat
 	}
 
 	if err := validateStatusUpdate(order, input); err != nil {
+		return model.Order{}, err
+	}
+	if err := s.ensureDriverAvailableForAcceptance(ctx, order, input); err != nil {
 		return model.Order{}, err
 	}
 
@@ -94,6 +104,30 @@ func (s *Service) UpdateStatus(ctx context.Context, id string, input model.Updat
 	}
 
 	return order, nil
+}
+
+func (s *Service) ensureDriverAvailableForAcceptance(ctx context.Context, order model.Order, input model.UpdateOrderStatusInput) error {
+	if input.Status != model.OrderStatusAccepted {
+		return nil
+	}
+
+	driverID := input.DriverID
+	if driverID == "" {
+		driverID = order.DriverID
+	}
+	if driverID == "" {
+		return nil
+	}
+
+	active, err := s.store.FindActiveByDriverID(ctx, driverID)
+	if err == nil && active.ID != order.ID {
+		return ErrDriverBusy
+	}
+	if err != nil && err != ErrNotFound {
+		return err
+	}
+
+	return nil
 }
 
 func validateStatusUpdate(order model.Order, input model.UpdateOrderStatusInput) error {
@@ -180,6 +214,15 @@ func isValidOrderTransition(from, to string) bool {
 	}
 
 	return allowed[from][to]
+}
+
+func isOrderActive(status string) bool {
+	switch status {
+	case model.OrderStatusAccepted, model.OrderStatusDriverArrived, model.OrderStatusInTrip:
+		return true
+	default:
+		return false
+	}
 }
 
 func newOrderID() string {

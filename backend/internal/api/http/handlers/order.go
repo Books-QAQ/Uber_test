@@ -70,6 +70,31 @@ func (h *OrderHandler) GetOrUpdateStatus(w http.ResponseWriter, r *http.Request)
 	h.getByID(w, r, path)
 }
 
+func (h *OrderHandler) GetCurrentByDriver(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		return
+	}
+
+	driverID, ok := lastPathParam(r.URL.Path, "/api/v1/drivers/", "/current-order")
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid current-order path"})
+		return
+	}
+
+	item, err := h.orderService.GetCurrentByDriverID(r.Context(), driverID)
+	if err != nil {
+		if errors.Is(err, order.ErrNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"item": item})
+}
+
 func (h *OrderHandler) getByID(w http.ResponseWriter, r *http.Request, orderID string) {
 	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
@@ -105,6 +130,10 @@ func (h *OrderHandler) updateStatus(w http.ResponseWriter, r *http.Request, orde
 	if err != nil {
 		if errors.Is(err, order.ErrNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, order.ErrDriverBusy) {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})
 			return
 		}
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})

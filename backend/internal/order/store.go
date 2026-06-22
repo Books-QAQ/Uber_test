@@ -13,6 +13,7 @@ type Store interface {
 	Create(ctx context.Context, order model.Order) error
 	GetByID(ctx context.Context, id string) (model.Order, error)
 	List(ctx context.Context) ([]model.Order, error)
+	FindActiveByDriverID(ctx context.Context, driverID string) (model.Order, error)
 	Update(ctx context.Context, order model.Order) error
 }
 
@@ -69,6 +70,22 @@ func (s *MemoryStore) List(_ context.Context) ([]model.Order, error) {
 	})
 
 	return items, nil
+}
+
+func (s *MemoryStore) FindActiveByDriverID(_ context.Context, driverID string) (model.Order, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, order := range s.orders {
+		if order.DriverID != driverID {
+			continue
+		}
+		if isOrderActive(order.Status) {
+			return order, nil
+		}
+	}
+
+	return model.Order{}, ErrNotFound
 }
 
 func (s *MemoryStore) Update(_ context.Context, order model.Order) error {
