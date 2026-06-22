@@ -94,6 +94,64 @@ func TestServiceHandlePacketSupportsBatchAndHeartbeat(t *testing.T) {
 	}
 }
 
+func TestServiceFindNearbyReturnsOnlyOnlineDrivers(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemoryStore(10)
+	broadcaster := &stubBroadcaster{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := NewService(store, broadcaster, logger)
+
+	now := time.Date(2026, 6, 22, 23, 10, 0, 0, time.UTC)
+	if err := store.Upsert(context.Background(), model.DriverLocation{
+		DriverID:  "driver-online",
+		Lat:       31.2304,
+		Lng:       121.4737,
+		Timestamp: now,
+	}); err != nil {
+		t.Fatalf("upsert online driver location: %v", err)
+	}
+	if err := store.Upsert(context.Background(), model.DriverLocation{
+		DriverID:  "driver-offline",
+		Lat:       31.2305,
+		Lng:       121.4738,
+		Timestamp: now.Add(time.Second),
+	}); err != nil {
+		t.Fatalf("upsert offline driver location: %v", err)
+	}
+
+	if err := service.SetDriverStatus(context.Background(), model.DriverStatus{
+		DriverID:  "driver-online",
+		Status:    model.DriverStatusOnline,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("set online status: %v", err)
+	}
+	if err := service.SetDriverStatus(context.Background(), model.DriverStatus{
+		DriverID:  "driver-offline",
+		Status:    model.DriverStatusOffline,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("set offline status: %v", err)
+	}
+
+	items, err := service.FindNearby(context.Background(), model.NearbyQuery{
+		Lat:     31.2304,
+		Lng:     121.4737,
+		RadiusM: 500,
+		Limit:   10,
+	})
+	if err != nil {
+		t.Fatalf("find nearby: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 online nearby driver, got %d", len(items))
+	}
+	if items[0].DriverID != "driver-online" {
+		t.Fatalf("expected driver-online, got %s", items[0].DriverID)
+	}
+}
+
 type testLocationInput struct {
 	driverID string
 	lat      float64

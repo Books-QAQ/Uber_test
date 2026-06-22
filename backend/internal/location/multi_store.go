@@ -52,6 +52,16 @@ func (s *MultiStore) TouchHeartbeat(ctx context.Context, heartbeat model.DriverH
 	return nil
 }
 
+func (s *MultiStore) SetDriverStatus(ctx context.Context, status model.DriverStatus) error {
+	if err := s.primary.SetDriverStatus(ctx, status); err != nil {
+		return fmt.Errorf("primary set driver status: %w", err)
+	}
+	if err := s.secondary.SetDriverStatus(ctx, status); err != nil {
+		return fmt.Errorf("secondary set driver status: %w", err)
+	}
+	return nil
+}
+
 func (s *MultiStore) ListLatest(ctx context.Context) ([]model.DriverLocation, error) {
 	items, err := s.primary.ListLatest(ctx)
 	if err == nil && len(items) > 0 {
@@ -64,6 +74,22 @@ func (s *MultiStore) ListLatest(ctx context.Context) ([]model.DriverLocation, er
 	items, secondaryErr := s.secondary.ListLatest(ctx)
 	if secondaryErr != nil {
 		return nil, fmt.Errorf("secondary list latest: %w", secondaryErr)
+	}
+	return items, nil
+}
+
+func (s *MultiStore) FindNearby(ctx context.Context, query model.NearbyQuery) ([]model.NearbyDriver, error) {
+	items, err := s.primary.FindNearby(ctx, query)
+	if err == nil && len(items) > 0 {
+		return items, nil
+	}
+	if err != nil {
+		s.logger.Warn("primary nearby store read failed, falling back to secondary", "error", err)
+	}
+
+	items, secondaryErr := s.secondary.FindNearby(ctx, query)
+	if secondaryErr != nil {
+		return nil, fmt.Errorf("secondary nearby read: %w", secondaryErr)
 	}
 	return items, nil
 }

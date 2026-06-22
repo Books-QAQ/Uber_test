@@ -11,6 +11,7 @@ import (
 	wsapi "uber-test/backend/internal/api/ws"
 	"uber-test/backend/internal/config"
 	"uber-test/backend/internal/location"
+	"uber-test/backend/internal/order"
 	udptransport "uber-test/backend/internal/transport/udp"
 )
 
@@ -41,10 +42,12 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		logger.Info("redis-backed location store enabled", "addr", cfg.RedisAddr, "db", cfg.RedisDB, "key_prefix", cfg.RedisKeyPrefix)
 	}
 	locationService := location.NewService(locationStore, hub, logger)
+	orderService := order.NewService(order.NewMemoryStore(), locationService)
 
 	router := httpapi.NewRouter(httpapi.RouterDeps{
 		Logger:          logger,
 		LocationService: locationService,
+		OrderService:    orderService,
 		Hub:             hub,
 		WSReadBuffer:    cfg.WSReadBuffer,
 		WSWriteBuffer:   cfg.WSWriteBuffer,

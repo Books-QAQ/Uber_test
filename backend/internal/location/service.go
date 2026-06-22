@@ -98,6 +98,32 @@ func (s *Service) ListLatest(ctx context.Context) ([]model.DriverLocation, error
 	return s.store.ListLatest(ctx)
 }
 
+func (s *Service) SetDriverStatus(ctx context.Context, status model.DriverStatus) error {
+	if status.DriverID == "" {
+		return fmt.Errorf("set driver status: missing driver_id")
+	}
+	if !model.IsDriverStatusAllowed(status.Status) {
+		return fmt.Errorf("set driver status: unsupported status %q", status.Status)
+	}
+	if status.UpdatedAt.IsZero() {
+		status.UpdatedAt = time.Now().UTC()
+	}
+
+	return s.store.SetDriverStatus(ctx, status)
+}
+
+func (s *Service) FindNearby(ctx context.Context, query model.NearbyQuery) ([]model.NearbyDriver, error) {
+	if query.Limit <= 0 {
+		query.Limit = 20
+	}
+	if query.RadiusM <= 0 {
+		query.RadiusM = 3000
+	}
+	query.OnlyLive = true
+
+	return s.store.FindNearby(ctx, query)
+}
+
 type decodedIngress struct {
 	Locations []model.DriverLocation
 	Heartbeat *model.DriverHeartbeat
