@@ -1,6 +1,7 @@
 package location
 
 import (
+	"context"
 	"slices"
 	"sync"
 
@@ -12,6 +13,7 @@ type MemoryStore struct {
 	maxRecent  int
 	latest     map[string]model.DriverLocation
 	recentByID map[string][]model.DriverLocation
+	heartbeats map[string]model.DriverHeartbeat
 }
 
 func NewMemoryStore(maxRecent int) *MemoryStore {
@@ -23,10 +25,11 @@ func NewMemoryStore(maxRecent int) *MemoryStore {
 		maxRecent:  maxRecent,
 		latest:     make(map[string]model.DriverLocation),
 		recentByID: make(map[string][]model.DriverLocation),
+		heartbeats: make(map[string]model.DriverHeartbeat),
 	}
 }
 
-func (s *MemoryStore) Upsert(location model.DriverLocation) {
+func (s *MemoryStore) Upsert(_ context.Context, location model.DriverLocation) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -37,9 +40,27 @@ func (s *MemoryStore) Upsert(location model.DriverLocation) {
 		recent = recent[len(recent)-s.maxRecent:]
 	}
 	s.recentByID[location.DriverID] = recent
+	return nil
 }
 
-func (s *MemoryStore) ListLatest() []model.DriverLocation {
+func (s *MemoryStore) UpsertBatch(ctx context.Context, locations []model.DriverLocation) error {
+	for _, location := range locations {
+		if err := s.Upsert(ctx, location); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *MemoryStore) TouchHeartbeat(_ context.Context, heartbeat model.DriverHeartbeat) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.heartbeats[heartbeat.DriverID] = heartbeat
+	return nil
+}
+
+func (s *MemoryStore) ListLatest(_ context.Context) ([]model.DriverLocation, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -58,15 +79,19 @@ func (s *MemoryStore) ListLatest() []model.DriverLocation {
 		return 0
 	})
 
-	return items
+	return items, nil
 }
 
-func (s *MemoryStore) ListRecent(driverID string) []model.DriverLocation {
+func (s *MemoryStore) ListRecent(_ context.Context, driverID string) ([]model.DriverLocation, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	items := s.recentByID[driverID]
 	out := make([]model.DriverLocation, len(items))
 	copy(out, items)
-	return out
+	return out, nil
+}
+
+func (s *MemoryStore) Close() error {
+	return nil
 }

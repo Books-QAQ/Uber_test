@@ -13,3 +13,10 @@ type DriverLocation struct {
 	Timestamp  time.Time `json:"timestamp"`
 	SourceAddr string    `json:"source_addr,omitempty"`
 }
+
+type DriverHeartbeat struct {
+	DriverID   string    `json:"driver_id"`
+	OrderID    string    `json:"order_id,omitempty"`
+	Timestamp  time.Time `json:"timestamp"`
+	SourceAddr string    `json:"source_addr,omitempty"`
+}

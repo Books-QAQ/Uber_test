@@ -2,12 +2,14 @@ package location
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/netip"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
+	locationpb "uber-test/backend/internal/gen/location/v1"
 	"uber-test/backend/internal/model"
 )
 
@@ -16,12 +18,12 @@ type Broadcaster interface {
 }
 
 type Service struct {
-	store       *MemoryStore
+	store       Store
 	broadcaster Broadcaster
 	logger      *slog.Logger
 }
 
-func NewService(store *MemoryStore, broadcaster Broadcaster, logger *slog.Logger) *Service {
+func NewService(store Store, broadcaster Broadcaster, logger *slog.Logger) *Service {
 	return &Service{
 		store:       store,
 		broadcaster: broadcaster,
@@ -36,36 +38,134 @@ func (s *Service) HandlePacket(ctx context.Context, remoteAddr netip.AddrPort, p
 	default:
 	}
 
-	update, err := decodeLocationPacket(payload)
+	message, err := decodeLocationPacket(payload)
 	if err != nil {
 		return err
 	}
 
-	if update.Timestamp.IsZero() {
-		update.Timestamp = time.Now().UTC()
+	switch {
+	case len(message.Locations) > 0:
+		for i := range message.Locations {
+			if message.Locations[i].Timestamp.IsZero() {
+				message.Locations[i].Timestamp = time.Now().UTC()
+			}
+			message.Locations[i].SourceAddr = remoteAddr.String()
+		}
+
+		if len(message.Locations) == 1 {
+			if err := s.store.Upsert(ctx, message.Locations[0]); err != nil {
+				return err
+			}
+			s.broadcaster.BroadcastJSON(map[string]any{
+				"type": "driver.location.updated",
+				"data": message.Locations[0],
+			})
+			s.logger.Debug("processed location update packet", "driver_id", message.Locations[0].DriverID, "remote_addr", remoteAddr.String())
+			return nil
+		}
+
+		if err := s.store.UpsertBatch(ctx, message.Locations); err != nil {
+			return err
+		}
+		s.broadcaster.BroadcastJSON(map[string]any{
+			"type":  "driver.location.batch.updated",
+			"count": len(message.Locations),
+			"data":  message.Locations,
+		})
+		s.logger.Debug("processed location batch packet", "count", len(message.Locations), "remote_addr", remoteAddr.String())
+		return nil
+	case message.Heartbeat != nil:
+		if message.Heartbeat.Timestamp.IsZero() {
+			message.Heartbeat.Timestamp = time.Now().UTC()
+		}
+		message.Heartbeat.SourceAddr = remoteAddr.String()
+
+		if err := s.store.TouchHeartbeat(ctx, *message.Heartbeat); err != nil {
+			return err
+		}
+		s.broadcaster.BroadcastJSON(map[string]any{
+			"type": "driver.heartbeat.received",
+			"data": message.Heartbeat,
+		})
+		s.logger.Debug("processed heartbeat packet", "driver_id", message.Heartbeat.DriverID, "remote_addr", remoteAddr.String())
+		return nil
+	default:
+		return fmt.Errorf("decoded location packet is empty")
 	}
-	update.SourceAddr = remoteAddr.String()
-
-	s.store.Upsert(update)
-	s.broadcaster.BroadcastJSON(map[string]any{
-		"type": "driver.location.updated",
-		"data": update,
-	})
-
-	s.logger.Debug("processed location packet", "driver_id", update.DriverID, "remote_addr", update.SourceAddr)
-	return nil
 }
 
-func (s *Service) ListLatest() []model.DriverLocation {
-	return s.store.ListLatest()
+func (s *Service) ListLatest(ctx context.Context) ([]model.DriverLocation, error) {
+	return s.store.ListLatest(ctx)
 }
 
-// decodeLocationPacket uses JSON temporarily so the scaffold is runnable
-// before the Protobuf schema and generated code are added.
-func decodeLocationPacket(payload []byte) (model.DriverLocation, error) {
-	var update model.DriverLocation
-	if err := json.Unmarshal(payload, &update); err != nil {
-		return model.DriverLocation{}, fmt.Errorf("decode location packet: %w", err)
+type decodedIngress struct {
+	Locations []model.DriverLocation
+	Heartbeat *model.DriverHeartbeat
+}
+
+func decodeLocationPacket(payload []byte) (decodedIngress, error) {
+	packet := &locationpb.LocationIngressPacket{}
+	if err := proto.Unmarshal(payload, packet); err != nil {
+		return decodedIngress{}, fmt.Errorf("decode protobuf location packet: %w", err)
+	}
+
+	switch payload := packet.Payload.(type) {
+	case *locationpb.LocationIngressPacket_LocationUpdate:
+		location, err := mapProtoLocation(payload.LocationUpdate)
+		if err != nil {
+			return decodedIngress{}, err
+		}
+		return decodedIngress{Locations: []model.DriverLocation{location}}, nil
+	case *locationpb.LocationIngressPacket_Heartbeat:
+		heartbeat, err := mapProtoHeartbeat(payload.Heartbeat)
+		if err != nil {
+			return decodedIngress{}, err
+		}
+		return decodedIngress{Heartbeat: &heartbeat}, nil
+	case *locationpb.LocationIngressPacket_LocationBatch:
+		locations := make([]model.DriverLocation, 0, len(payload.LocationBatch.GetLocations()))
+		for _, item := range payload.LocationBatch.GetLocations() {
+			location, err := mapProtoLocation(item)
+			if err != nil {
+				return decodedIngress{}, err
+			}
+			locations = append(locations, location)
+		}
+		return decodedIngress{Locations: locations}, nil
+	default:
+		return decodedIngress{}, fmt.Errorf("decode protobuf location packet: unsupported payload")
+	}
+}
+
+func mapProtoLocation(packet *locationpb.DriverLocationUpdate) (model.DriverLocation, error) {
+	update := model.DriverLocation{
+		DriverID:  packet.GetDriverId(),
+		OrderID:   packet.GetOrderId(),
+		Lat:       packet.GetLat(),
+		Lng:       packet.GetLng(),
+		SpeedKPH:  packet.GetSpeedKph(),
+		Heading:   packet.GetHeading(),
+		AccuracyM: packet.GetAccuracyM(),
+	}
+	if reportedAt := packet.GetReportedAtUnixMs(); reportedAt > 0 {
+		update.Timestamp = time.UnixMilli(reportedAt).UTC()
+	}
+	if update.DriverID == "" {
+		return model.DriverLocation{}, fmt.Errorf("decode protobuf location packet: missing driver_id")
 	}
 	return update, nil
+}
+
+func mapProtoHeartbeat(packet *locationpb.DriverHeartbeat) (model.DriverHeartbeat, error) {
+	heartbeat := model.DriverHeartbeat{
+		DriverID: packet.GetDriverId(),
+		OrderID:  packet.GetOrderId(),
+	}
+	if reportedAt := packet.GetReportedAtUnixMs(); reportedAt > 0 {
+		heartbeat.Timestamp = time.UnixMilli(reportedAt).UTC()
+	}
+	if heartbeat.DriverID == "" {
+		return model.DriverHeartbeat{}, fmt.Errorf("decode protobuf heartbeat packet: missing driver_id")
+	}
+	return heartbeat, nil
 }

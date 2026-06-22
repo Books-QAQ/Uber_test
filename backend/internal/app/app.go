@@ -20,11 +20,26 @@ type App struct {
 	httpServer *http.Server
 	udpServer  *udptransport.Server
 	hub        *wsapi.Hub
+	store      location.Store
 }
 
-func New(cfg config.Config, logger *slog.Logger) *App {
+func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	hub := wsapi.NewHub(logger)
-	locationStore := location.NewMemoryStore(cfg.RecentLocationLimit)
+	locationStore := location.Store(location.NewMemoryStore(cfg.RecentLocationLimit))
+	if cfg.RedisEnabled {
+		redisStore, err := location.NewRedisStore(context.Background(), location.RedisConfig{
+			Addr:      cfg.RedisAddr,
+			Password:  cfg.RedisPassword,
+			DB:        cfg.RedisDB,
+			KeyPrefix: cfg.RedisKeyPrefix,
+			TTL:       cfg.RedisLocationTTL,
+		}, cfg.RecentLocationLimit)
+		if err != nil {
+			return nil, fmt.Errorf("create redis location store: %w", err)
+		}
+		locationStore = location.NewMultiStore(locationStore, redisStore, logger)
+		logger.Info("redis-backed location store enabled", "addr", cfg.RedisAddr, "db", cfg.RedisDB, "key_prefix", cfg.RedisKeyPrefix)
+	}
 	locationService := location.NewService(locationStore, hub, logger)
 
 	router := httpapi.NewRouter(httpapi.RouterDeps{
@@ -44,7 +59,8 @@ func New(cfg config.Config, logger *slog.Logger) *App {
 		},
 		udpServer: udptransport.NewServer(cfg.UDPAddr, locationService, logger),
 		hub:       hub,
-	}
+		store:     locationStore,
+	}, nil
 }
 
 func (a *App) Run(ctx context.Context) error {
@@ -89,6 +105,10 @@ func (a *App) shutdown(ctx context.Context) error {
 	}
 
 	if err := a.httpServer.Shutdown(ctx); err != nil {
+		return err
+	}
+
+	if err := a.store.Close(); err != nil {
 		return err
 	}
 

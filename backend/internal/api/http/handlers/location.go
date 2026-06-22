@@ -14,8 +14,16 @@ func NewLocationHandler(locationService *location.Service) *LocationHandler {
 	return &LocationHandler{locationService: locationService}
 }
 
-func (h *LocationHandler) ListLatest(w http.ResponseWriter, _ *http.Request) {
+func (h *LocationHandler) ListLatest(w http.ResponseWriter, r *http.Request) {
+	items, err := h.locationService.ListLatest(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error": err.Error(),
+		})
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"items": h.locationService.ListLatest(),
+		"items": items,
 	})
 }
