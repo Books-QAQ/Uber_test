@@ -8,6 +8,7 @@ import (
 
 	"uber-test/backend/internal/api/http/middleware"
 	"uber-test/backend/internal/auth"
+	"uber-test/backend/internal/dispatch"
 	"uber-test/backend/internal/model"
 	"uber-test/backend/internal/order"
 )
@@ -209,6 +210,10 @@ func (h *OrderHandler) updateStatus(w http.ResponseWriter, r *http.Request, orde
 		}
 		if errors.Is(err, order.ErrDriverBusy) {
 			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, dispatch.ErrDriverNotDispatched) {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
 			return
 		}
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})

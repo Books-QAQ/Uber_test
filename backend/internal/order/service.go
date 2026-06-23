@@ -14,6 +14,7 @@ type Service struct {
 	store              Store
 	driverStatusWriter DriverStatusWriter
 	tripLifecycle      TripLifecycleWriter
+	dispatcher         DispatchCoordinator
 }
 
 type DriverStatusWriter interface {
@@ -24,11 +25,19 @@ type TripLifecycleWriter interface {
 	SyncWithOrder(ctx context.Context, order model.Order, input model.UpdateOrderStatusInput) (model.Trip, error)
 }
 
-func NewService(store Store, driverStatusWriter DriverStatusWriter, tripLifecycle TripLifecycleWriter) *Service {
+type DispatchCoordinator interface {
+	DispatchOrder(ctx context.Context, order model.Order) error
+	EnsureDriverCanAccept(ctx context.Context, orderID, driverID string) error
+	MarkAccepted(ctx context.Context, orderID, driverID string) error
+	ClosePendingByOrderID(ctx context.Context, orderID, status string) error
+}
+
+func NewService(store Store, driverStatusWriter DriverStatusWriter, tripLifecycle TripLifecycleWriter, dispatcher DispatchCoordinator) *Service {
 	return &Service{
 		store:              store,
 		driverStatusWriter: driverStatusWriter,
 		tripLifecycle:      tripLifecycle,
+		dispatcher:         dispatcher,
 	}
 }
 
@@ -55,6 +64,11 @@ func (s *Service) Create(ctx context.Context, input model.CreateOrderInput) (mod
 
 	if err := s.store.Create(ctx, order); err != nil {
 		return model.Order{}, err
+	}
+	if s.dispatcher != nil {
+		if err := s.dispatcher.DispatchOrder(ctx, order); err != nil {
+			return model.Order{}, err
+		}
 	}
 
 	return order, nil
@@ -101,6 +115,9 @@ func (s *Service) UpdateStatus(ctx context.Context, id string, input model.Updat
 	if err := s.ensureDriverAvailableForAcceptance(ctx, order, input); err != nil {
 		return model.Order{}, err
 	}
+	if err := s.ensureDispatchEligibility(ctx, order, input); err != nil {
+		return model.Order{}, err
+	}
 
 	if !isValidOrderTransition(order.Status, input.Status) {
 		return model.Order{}, fmt.Errorf("invalid order status transition: %s -> %s", order.Status, input.Status)
@@ -120,6 +137,9 @@ func (s *Service) UpdateStatus(ctx context.Context, id string, input model.Updat
 	}
 
 	if err := s.store.Update(ctx, order); err != nil {
+		return model.Order{}, err
+	}
+	if err := s.syncDispatch(ctx, order, input.Status); err != nil {
 		return model.Order{}, err
 	}
 
@@ -152,6 +172,18 @@ func (s *Service) ensureDriverAvailableForAcceptance(ctx context.Context, order 
 	}
 
 	return nil
+}
+
+func (s *Service) ensureDispatchEligibility(ctx context.Context, order model.Order, input model.UpdateOrderStatusInput) error {
+	if input.Status != model.OrderStatusAccepted || s.dispatcher == nil {
+		return nil
+	}
+
+	driverID := input.DriverID
+	if driverID == "" {
+		driverID = order.DriverID
+	}
+	return s.dispatcher.EnsureDriverCanAccept(ctx, order.ID, driverID)
 }
 
 func validateStatusUpdate(order model.Order, input model.UpdateOrderStatusInput) error {
@@ -223,6 +255,21 @@ func (s *Service) syncTrip(ctx context.Context, order *model.Order, input model.
 	}
 
 	return nil
+}
+
+func (s *Service) syncDispatch(ctx context.Context, order model.Order, status string) error {
+	if s.dispatcher == nil {
+		return nil
+	}
+
+	switch status {
+	case model.OrderStatusAccepted:
+		return s.dispatcher.MarkAccepted(ctx, order.ID, order.DriverID)
+	case model.OrderStatusCancelled:
+		return s.dispatcher.ClosePendingByOrderID(ctx, order.ID, model.DispatchStatusCancelled)
+	default:
+		return nil
+	}
 }
 
 func isValidOrderTransition(from, to string) bool {

@@ -13,6 +13,7 @@ import (
 	wsapi "uber-test/backend/internal/api/ws"
 	"uber-test/backend/internal/auth"
 	"uber-test/backend/internal/config"
+	"uber-test/backend/internal/dispatch"
 	"uber-test/backend/internal/location"
 	"uber-test/backend/internal/order"
 	mysqlstorage "uber-test/backend/internal/storage/mysql"
@@ -79,7 +80,8 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	}
 	locationService := location.NewService(locationStore, hub, logger)
 	tripService := trip.NewService(tripStore)
-	orderService := order.NewService(orderStore, locationService, tripService)
+	dispatchService := dispatch.NewService(dispatch.NewMemoryStore(), orderStore, locationService, hub, logger)
+	orderService := order.NewService(orderStore, locationService, tripService, dispatchService)
 
 	router := httpapi.NewRouter(httpapi.RouterDeps{
 		Logger:          logger,
@@ -88,6 +90,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		LocationService: locationService,
 		OrderService:    orderService,
 		TripService:     tripService,
+		DispatchService: dispatchService,
 		Hub:             hub,
 		WSReadBuffer:    cfg.WSReadBuffer,
 		WSWriteBuffer:   cfg.WSWriteBuffer,

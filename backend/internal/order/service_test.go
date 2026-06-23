@@ -10,6 +10,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"uber-test/backend/internal/dispatch"
 	locationpb "uber-test/backend/internal/gen/location/v1"
 	"uber-test/backend/internal/location"
 	"uber-test/backend/internal/model"
@@ -28,7 +29,7 @@ func TestServiceCreateAndUpdateStatus(t *testing.T) {
 	t.Parallel()
 
 	driverWriter := &stubDriverStatusWriter{}
-	service := NewService(NewMemoryStore(), driverWriter, nil)
+	service := NewService(NewMemoryStore(), driverWriter, nil, nil)
 
 	order, err := service.Create(context.Background(), model.CreateOrderInput{
 		PassengerID:        "passenger-1",
@@ -71,7 +72,7 @@ func TestServiceUpdateStatusLifecycleSyncsDriverStatus(t *testing.T) {
 	t.Parallel()
 
 	driverWriter := &stubDriverStatusWriter{}
-	service := NewService(NewMemoryStore(), driverWriter, nil)
+	service := NewService(NewMemoryStore(), driverWriter, nil, nil)
 
 	order, err := service.Create(context.Background(), model.CreateOrderInput{
 		PassengerID:    "passenger-2",
@@ -132,7 +133,7 @@ func TestServiceAcceptedOrderRemovesDriverFromNearbyAvailability(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	locationService := location.NewService(location.NewMemoryStore(10), nilBroadcaster{}, logger)
-	service := NewService(NewMemoryStore(), locationService, nil)
+	service := NewService(NewMemoryStore(), locationService, nil, nil)
 
 	if err := locationService.SetDriverStatus(context.Background(), model.DriverStatus{
 		DriverID:  "driver-3",
@@ -184,7 +185,7 @@ func (nilBroadcaster) BroadcastJSON(any) {}
 func TestServiceRejectsSecondActiveOrderForSameDriver(t *testing.T) {
 	t.Parallel()
 
-	service := NewService(NewMemoryStore(), nil, nil)
+	service := NewService(NewMemoryStore(), nil, nil, nil)
 
 	first, err := service.Create(context.Background(), model.CreateOrderInput{
 		PassengerID:    "passenger-a",
@@ -225,7 +226,7 @@ func TestServiceRejectsSecondActiveOrderForSameDriver(t *testing.T) {
 func TestServiceGetCurrentByDriverID(t *testing.T) {
 	t.Parallel()
 
-	service := NewService(NewMemoryStore(), nil, nil)
+	service := NewService(NewMemoryStore(), nil, nil, nil)
 
 	order, err := service.Create(context.Background(), model.CreateOrderInput{
 		PassengerID:    "passenger-current",
@@ -251,6 +252,74 @@ func TestServiceGetCurrentByDriverID(t *testing.T) {
 	}
 	if current.ID != order.ID {
 		t.Fatalf("expected current order %s, got %s", order.ID, current.ID)
+	}
+}
+
+func TestServiceCreateTriggersDispatchAndRestrictsAcceptance(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	locationService := location.NewService(location.NewMemoryStore(10), nilBroadcaster{}, logger)
+	orderStore := NewMemoryStore()
+	dispatchService := dispatch.NewService(dispatch.NewMemoryStore(), orderStore, locationService, nilBroadcaster{}, logger)
+	service := NewService(orderStore, locationService, nil, dispatchService)
+
+	if err := locationService.SetDriverStatus(context.Background(), model.DriverStatus{
+		DriverID:  "driver-dispatch-1",
+		Status:    model.DriverStatusOnline,
+		UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("set driver 1 online: %v", err)
+	}
+	if err := locationService.SetDriverStatus(context.Background(), model.DriverStatus{
+		DriverID:  "driver-dispatch-2",
+		Status:    model.DriverStatusOnline,
+		UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("set driver 2 online: %v", err)
+	}
+	if err := locationService.HandlePacket(context.Background(), mustAddrPort("127.0.0.1:19010"), mustSingleLocationPayload("driver-dispatch-1", 31.2304, 121.4737)); err != nil {
+		t.Fatalf("seed driver 1 location: %v", err)
+	}
+	if err := locationService.HandlePacket(context.Background(), mustAddrPort("127.0.0.1:19011"), mustSingleLocationPayload("driver-dispatch-2", 31.3304, 121.5737)); err != nil {
+		t.Fatalf("seed driver 2 location: %v", err)
+	}
+
+	orderItem, err := service.Create(context.Background(), model.CreateOrderInput{
+		PassengerID:    "passenger-dispatch",
+		PickupLat:      31.2304,
+		PickupLng:      121.4737,
+		DestinationLat: 31.2204,
+		DestinationLng: 121.4637,
+	})
+	if err != nil {
+		t.Fatalf("create order: %v", err)
+	}
+
+	assignments, err := dispatchService.ListPendingAssignmentsByDriverID(context.Background(), "driver-dispatch-1")
+	if err != nil {
+		t.Fatalf("list assignments for dispatched driver: %v", err)
+	}
+	if len(assignments) != 1 {
+		t.Fatalf("expected 1 pending dispatch for driver-dispatch-1, got %d", len(assignments))
+	}
+
+	if _, err := service.UpdateStatus(context.Background(), orderItem.ID, model.UpdateOrderStatusInput{
+		Status:   model.OrderStatusAccepted,
+		DriverID: "driver-not-dispatched",
+	}); err != dispatch.ErrDriverNotDispatched {
+		t.Fatalf("expected ErrDriverNotDispatched, got %v", err)
+	}
+
+	updated, err := service.UpdateStatus(context.Background(), orderItem.ID, model.UpdateOrderStatusInput{
+		Status:   model.OrderStatusAccepted,
+		DriverID: "driver-dispatch-1",
+	})
+	if err != nil {
+		t.Fatalf("accept order with dispatched driver: %v", err)
+	}
+	if updated.DriverID != "driver-dispatch-1" {
+		t.Fatalf("expected driver-dispatch-1, got %s", updated.DriverID)
 	}
 }
 

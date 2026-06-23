@@ -9,6 +9,7 @@ import (
 	"uber-test/backend/internal/api/http/middleware"
 	wsapi "uber-test/backend/internal/api/ws"
 	"uber-test/backend/internal/auth"
+	"uber-test/backend/internal/dispatch"
 	"uber-test/backend/internal/location"
 	"uber-test/backend/internal/model"
 	"uber-test/backend/internal/order"
@@ -22,6 +23,7 @@ type RouterDeps struct {
 	LocationService *location.Service
 	OrderService    *order.Service
 	TripService     *trip.Service
+	DispatchService *dispatch.Service
 	Hub             *wsapi.Hub
 	WSReadBuffer    int
 	WSWriteBuffer   int
@@ -36,6 +38,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 	driverHandler := handlers.NewDriverHandler(deps.LocationService)
 	tripHandler := handlers.NewTripHandler(deps.TripService)
 	orderHandler := handlers.NewOrderHandler(deps.OrderService, tripHandler)
+	dispatchHandler := handlers.NewDispatchHandler(deps.DispatchService)
 	requireAuth := deps.Authenticator.RequireAuth
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -48,7 +51,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 	mux.HandleFunc("/api/v1/auth/register", authHandler.Register)
 	mux.HandleFunc("/api/v1/auth/login", authHandler.Login)
 	mux.Handle("/api/v1/auth/me", requireAuth(http.HandlerFunc(authHandler.Me)))
-	mux.Handle("/api/v1/drivers/", requireAuth(middleware.RequireRoles(model.RoleDriver, model.RoleAdmin)(http.HandlerFunc(routeDriverSubresources(driverHandler, orderHandler)))))
+	mux.Handle("/api/v1/drivers/", requireAuth(middleware.RequireRoles(model.RoleDriver, model.RoleAdmin)(http.HandlerFunc(routeDriverSubresources(driverHandler, orderHandler, dispatchHandler)))))
 	mux.Handle("/api/v1/drivers/nearby", requireAuth(middleware.RequireRoles(model.RolePassenger, model.RoleDriver, model.RoleAdmin)(http.HandlerFunc(driverHandler.ListNearby))))
 	mux.Handle("/api/v1/drivers/locations", requireAuth(middleware.RequireRoles(model.RoleAdmin)(http.HandlerFunc(locationHandler.ListLatest))))
 	mux.Handle("/api/v1/orders", requireAuth(middleware.RequireRoles(model.RolePassenger, model.RoleDriver, model.RoleAdmin)(http.HandlerFunc(routeOrderCollection(orderHandler)))))
@@ -74,13 +77,15 @@ func routeOrderCollection(handler *handlers.OrderHandler) http.HandlerFunc {
 	}
 }
 
-func routeDriverSubresources(driverHandler *handlers.DriverHandler, orderHandler *handlers.OrderHandler) http.HandlerFunc {
+func routeDriverSubresources(driverHandler *handlers.DriverHandler, orderHandler *handlers.OrderHandler, dispatchHandler *handlers.DispatchHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/status"):
 			driverHandler.SetStatus(w, r)
 		case strings.HasSuffix(r.URL.Path, "/current-order"):
 			orderHandler.GetCurrentByDriver(w, r)
+		case strings.HasSuffix(r.URL.Path, "/dispatches"):
+			dispatchHandler.ListPendingByDriver(w, r)
 		default:
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
