@@ -26,6 +26,7 @@ type Config struct {
 	RedisDB              int
 	RedisKeyPrefix       string
 	RedisLocationTTL     time.Duration
+	RedisDispatchTTL     time.Duration
 	ShutdownTimeout      time.Duration
 }
 
@@ -50,6 +51,7 @@ func Load() Config {
 		RedisDB:              getEnvInt("REDIS_DB", 0),
 		RedisKeyPrefix:       getEnv("REDIS_KEY_PREFIX", "uber-test"),
 		RedisLocationTTL:     getEnvDuration("REDIS_LOCATION_TTL", 24*time.Hour),
+		RedisDispatchTTL:     getEnvDuration("REDIS_DISPATCH_TTL", 30*time.Minute),
 		ShutdownTimeout:      getEnvDuration("SHUTDOWN_TIMEOUT", 10*time.Second),
 	}
 }

@@ -46,3 +46,18 @@ CREATE TABLE IF NOT EXISTS trips (
     updated_at DATETIME NOT NULL,
     INDEX idx_trips_driver_id (driver_id)
 );
+
+CREATE TABLE IF NOT EXISTS dispatches (
+    id VARCHAR(64) PRIMARY KEY,
+    order_id VARCHAR(64) NOT NULL,
+    driver_id VARCHAR(64) NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    distance_m DOUBLE NOT NULL DEFAULT 0,
+    dispatch_round INT NOT NULL DEFAULT 1,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    responded_at DATETIME NULL,
+    INDEX idx_dispatches_driver_status (driver_id, status),
+    INDEX idx_dispatches_order_status (order_id, status),
+    INDEX idx_dispatches_order_driver_status (order_id, driver_id, status)
+);

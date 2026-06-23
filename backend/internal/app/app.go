@@ -28,6 +28,7 @@ type App struct {
 	udpServer  *udptransport.Server
 	hub        *wsapi.Hub
 	store      location.Store
+	dispatch   dispatch.Store
 	db         *sql.DB
 }
 
@@ -39,6 +40,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	locationStore := location.Store(location.NewMemoryStore(cfg.RecentLocationLimit))
 	orderStore := order.Store(order.NewMemoryStore())
 	tripStore := trip.Store(trip.NewMemoryStore())
+	dispatchStore := dispatch.Store(dispatch.NewMemoryStore())
 	var db *sql.DB
 
 	if cfg.MySQLEnabled {
@@ -60,12 +62,13 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		authStore = auth.NewMySQLStore(openedDB)
 		orderStore = order.NewMySQLStore(openedDB)
 		tripStore = trip.NewMySQLStore(openedDB)
-		logger.Info("mysql-backed auth/order/trip stores enabled")
+		dispatchStore = dispatch.NewMySQLStore(openedDB)
+		logger.Info("mysql-backed auth/order/trip/dispatch stores enabled")
 	}
 
 	authService := auth.NewService(authStore, tokenManager)
 	if cfg.RedisEnabled {
-		redisStore, err := location.NewRedisStore(context.Background(), location.RedisConfig{
+		locationRedisStore, err := location.NewRedisStore(context.Background(), location.RedisConfig{
 			Addr:      cfg.RedisAddr,
 			Password:  cfg.RedisPassword,
 			DB:        cfg.RedisDB,
@@ -75,12 +78,25 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		if err != nil {
 			return nil, fmt.Errorf("create redis location store: %w", err)
 		}
-		locationStore = location.NewMultiStore(locationStore, redisStore, logger)
-		logger.Info("redis-backed location store enabled", "addr", cfg.RedisAddr, "db", cfg.RedisDB, "key_prefix", cfg.RedisKeyPrefix)
+		dispatchRedisStore, err := dispatch.NewRedisStore(context.Background(), dispatch.RedisConfig{
+			Addr:      cfg.RedisAddr,
+			Password:  cfg.RedisPassword,
+			DB:        cfg.RedisDB,
+			KeyPrefix: cfg.RedisKeyPrefix,
+			TTL:       cfg.RedisDispatchTTL,
+		})
+		if err != nil {
+			_ = locationRedisStore.Close()
+			return nil, fmt.Errorf("create redis dispatch store: %w", err)
+		}
+
+		locationStore = location.NewMultiStore(locationStore, locationRedisStore, logger)
+		dispatchStore = dispatch.NewMultiStore(dispatchRedisStore, dispatchStore, logger)
+		logger.Info("redis-backed location/dispatch stores enabled", "addr", cfg.RedisAddr, "db", cfg.RedisDB, "key_prefix", cfg.RedisKeyPrefix)
 	}
 	locationService := location.NewService(locationStore, hub, logger)
 	tripService := trip.NewService(tripStore)
-	dispatchService := dispatch.NewService(dispatch.NewMemoryStore(), orderStore, locationService, hub, logger)
+	dispatchService := dispatch.NewService(dispatchStore, orderStore, locationService, hub, logger)
 	orderService := order.NewService(orderStore, locationService, tripService, dispatchService)
 
 	router := httpapi.NewRouter(httpapi.RouterDeps{
@@ -106,6 +122,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		udpServer: udptransport.NewServer(cfg.UDPAddr, locationService, logger),
 		hub:       hub,
 		store:     locationStore,
+		dispatch:  dispatchStore,
 		db:        db,
 	}, nil
 }
@@ -163,6 +180,11 @@ func (a *App) shutdown(ctx context.Context) error {
 
 	if err := a.store.Close(); err != nil {
 		return err
+	}
+	if a.dispatch != nil {
+		if err := a.dispatch.Close(); err != nil {
+			return err
+		}
 	}
 
 	done := make(chan struct{})

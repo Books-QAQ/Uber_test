@@ -16,6 +16,7 @@ type Store interface {
 	GetPendingByOrderAndDriver(ctx context.Context, orderID, driverID string) (model.DispatchRecord, error)
 	MarkAccepted(ctx context.Context, orderID, driverID string, acceptedAt time.Time) error
 	UpdatePendingStatusByOrderID(ctx context.Context, orderID, status string, updatedAt time.Time) error
+	Close() error
 }
 
 type MemoryStore struct {
@@ -119,6 +120,10 @@ func (s *MemoryStore) UpdatePendingStatusByOrderID(_ context.Context, orderID, s
 		s.records[id] = record
 	}
 
+	return nil
+}
+
+func (s *MemoryStore) Close() error {
 	return nil
 }
 
