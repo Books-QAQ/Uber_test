@@ -2,6 +2,7 @@ package location
 
 import (
 	"context"
+	"time"
 
 	"uber-test/backend/internal/model"
 )
@@ -14,5 +15,6 @@ type Store interface {
 	ListLatest(ctx context.Context) ([]model.DriverLocation, error)
 	ListRecent(ctx context.Context, driverID string) ([]model.DriverLocation, error)
 	FindNearby(ctx context.Context, query model.NearbyQuery) ([]model.NearbyDriver, error)
+	ExpireInactive(ctx context.Context, cutoff time.Time) ([]model.DriverStatus, error)
 	Close() error
 }

@@ -74,6 +74,60 @@ func (s *MySQLStore) ListPendingByDriverID(ctx context.Context, driverID string)
 	return items, nil
 }
 
+func (s *MySQLStore) ListPendingByOrderID(ctx context.Context, orderID string) ([]model.DispatchRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, order_id, driver_id, status, distance_m, dispatch_round, created_at, updated_at, responded_at
+		FROM dispatches
+		WHERE order_id = ? AND status = ?
+		ORDER BY distance_m ASC, created_at DESC
+	`, orderID, model.DispatchStatusPending)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]model.DispatchRecord, 0)
+	for rows.Next() {
+		record, scanErr := scanDispatchRecord(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		items = append(items, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	sortPendingDispatches(items)
+	return items, nil
+}
+
+func (s *MySQLStore) ListByOrderID(ctx context.Context, orderID string) ([]model.DispatchRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, order_id, driver_id, status, distance_m, dispatch_round, created_at, updated_at, responded_at
+		FROM dispatches
+		WHERE order_id = ?
+		ORDER BY dispatch_round DESC, created_at DESC
+	`, orderID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]model.DispatchRecord, 0)
+	for rows.Next() {
+		record, scanErr := scanDispatchRecord(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		items = append(items, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 func (s *MySQLStore) GetPendingByOrderAndDriver(ctx context.Context, orderID, driverID string) (model.DispatchRecord, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, order_id, driver_id, status, distance_m, dispatch_round, created_at, updated_at, responded_at
@@ -131,6 +185,17 @@ func (s *MySQLStore) UpdatePendingStatusByOrderID(ctx context.Context, orderID, 
 		    responded_at = ?
 		WHERE order_id = ? AND status = ?
 	`, status, updatedAt, updatedAt, orderID, model.DispatchStatusPending)
+	return err
+}
+
+func (s *MySQLStore) UpdatePendingStatusByDriverID(ctx context.Context, driverID, status string, updatedAt time.Time) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE dispatches
+		SET status = ?,
+		    updated_at = ?,
+		    responded_at = ?
+		WHERE driver_id = ? AND status = ?
+	`, status, updatedAt, updatedAt, driverID, model.DispatchStatusPending)
 	return err
 }
 

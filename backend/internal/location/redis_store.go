@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,11 +73,13 @@ func (s *RedisStore) UpsertBatch(ctx context.Context, locations []model.DriverLo
 		latestKey := s.latestKey(location.DriverID)
 		recentKey := s.recentKey(location.DriverID)
 		statusKey := s.statusKey(location.DriverID)
+		activityKey := s.activityKey(location.DriverID)
 
 		pipe.SAdd(ctx, driverSetKey, location.DriverID)
 		pipe.Set(ctx, latestKey, payload, s.ttl)
 		pipe.LPush(ctx, recentKey, payload)
 		pipe.LTrim(ctx, recentKey, 0, int64(s.maxRecent-1))
+		pipe.Set(ctx, activityKey, strconv.FormatInt(location.Timestamp.UnixMilli(), 10), s.ttl)
 
 		statusPayload, err := s.client.Get(ctx, statusKey).Result()
 		statusAvailable := err == nil && strings.Contains(statusPayload, `"status":"online"`)
@@ -92,6 +95,7 @@ func (s *RedisStore) UpsertBatch(ctx context.Context, locations []model.DriverLo
 			pipe.Expire(ctx, recentKey, s.ttl)
 			pipe.Expire(ctx, driverSetKey, s.ttl)
 			pipe.Expire(ctx, statusKey, s.ttl)
+			pipe.Expire(ctx, activityKey, s.ttl)
 			pipe.Expire(ctx, s.onlineGeoKey(), s.ttl)
 		}
 	}
@@ -110,14 +114,22 @@ func (s *RedisStore) TouchHeartbeat(ctx context.Context, heartbeat model.DriverH
 	}
 
 	key := s.heartbeatKey(heartbeat.DriverID)
+	activityKey := s.activityKey(heartbeat.DriverID)
+	activityValue := strconv.FormatInt(heartbeat.Timestamp.UnixMilli(), 10)
 	if s.ttl > 0 {
-		if err := s.client.Set(ctx, key, payload, s.ttl).Err(); err != nil {
+		pipe := s.client.Pipeline()
+		pipe.Set(ctx, key, payload, s.ttl)
+		pipe.Set(ctx, activityKey, activityValue, s.ttl)
+		if _, err := pipe.Exec(ctx); err != nil {
 			return fmt.Errorf("set heartbeat: %w", err)
 		}
 		return nil
 	}
 
-	if err := s.client.Set(ctx, key, payload, 0).Err(); err != nil {
+	pipe := s.client.Pipeline()
+	pipe.Set(ctx, key, payload, 0)
+	pipe.Set(ctx, activityKey, activityValue, 0)
+	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("set heartbeat: %w", err)
 	}
 	return nil
@@ -309,6 +321,71 @@ func (s *RedisStore) ListRecent(ctx context.Context, driverID string) ([]model.D
 	return items, nil
 }
 
+func (s *RedisStore) ExpireInactive(ctx context.Context, cutoff time.Time) ([]model.DriverStatus, error) {
+	driverIDs, err := s.client.SMembers(ctx, s.driverSetKey()).Result()
+	if err != nil {
+		return nil, fmt.Errorf("load driver ids for expiration: %w", err)
+	}
+	if len(driverIDs) == 0 {
+		return nil, nil
+	}
+
+	pipe := s.client.Pipeline()
+	activityCmds := make(map[string]*redis.StringCmd, len(driverIDs))
+	statusCmds := make(map[string]*redis.StringCmd, len(driverIDs))
+	for _, driverID := range driverIDs {
+		activityCmds[driverID] = pipe.Get(ctx, s.activityKey(driverID))
+		statusCmds[driverID] = pipe.Get(ctx, s.statusKey(driverID))
+	}
+	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+		return nil, fmt.Errorf("load driver activity for expiration: %w", err)
+	}
+
+	expired := make([]model.DriverStatus, 0)
+	for _, driverID := range driverIDs {
+		statusPayload, err := statusCmds[driverID].Result()
+		if err == redis.Nil {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read driver status for expiration: %w", err)
+		}
+
+		var status model.DriverStatus
+		if err := json.Unmarshal([]byte(statusPayload), &status); err != nil {
+			return nil, fmt.Errorf("unmarshal driver status for expiration: %w", err)
+		}
+		if status.Status == model.DriverStatusOffline {
+			continue
+		}
+
+		activityPayload, err := activityCmds[driverID].Result()
+		if err == redis.Nil {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read driver activity for expiration: %w", err)
+		}
+
+		unixMS, err := strconv.ParseInt(activityPayload, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse driver activity for expiration: %w", err)
+		}
+		if time.UnixMilli(unixMS).UTC().After(cutoff) {
+			continue
+		}
+
+		status.Status = model.DriverStatusOffline
+		status.UpdatedAt = cutoff
+		if err := s.SetDriverStatus(ctx, status); err != nil {
+			return nil, err
+		}
+		expired = append(expired, status)
+	}
+
+	return expired, nil
+}
+
 func (s *RedisStore) Close() error {
 	return s.client.Close()
 }
@@ -327,6 +404,10 @@ func (s *RedisStore) recentKey(driverID string) string {
 
 func (s *RedisStore) heartbeatKey(driverID string) string {
 	return s.key("driver:heartbeat:" + driverID)
+}
+
+func (s *RedisStore) activityKey(driverID string) string {
+	return s.key("driver:activity:" + driverID)
 }
 
 func (s *RedisStore) statusKey(driverID string) string {

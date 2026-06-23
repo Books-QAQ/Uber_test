@@ -16,12 +16,14 @@ import (
 type OrderHandler struct {
 	orderService *order.Service
 	tripHandler  *TripHandler
+	routeHandler *RouteHandler
 }
 
-func NewOrderHandler(orderService *order.Service, tripHandler *TripHandler) *OrderHandler {
+func NewOrderHandler(orderService *order.Service, tripHandler *TripHandler, routeHandler *RouteHandler) *OrderHandler {
 	return &OrderHandler{
 		orderService: orderService,
 		tripHandler:  tripHandler,
+		routeHandler: routeHandler,
 	}
 }
 
@@ -110,6 +112,10 @@ func (h *OrderHandler) GetOrUpdateStatus(w http.ResponseWriter, r *http.Request)
 	}
 	if strings.HasSuffix(path, "/trip") {
 		h.getTrip(w, r, strings.TrimSuffix(path, "/trip"))
+		return
+	}
+	if strings.HasSuffix(path, "/route") {
+		h.getRoute(w, r, strings.TrimSuffix(path, "/route"))
 		return
 	}
 
@@ -248,6 +254,37 @@ func (h *OrderHandler) getTrip(w http.ResponseWriter, r *http.Request, orderID s
 	}
 
 	h.tripHandler.GetByOrderID(w, r, orderID)
+}
+
+func (h *OrderHandler) getRoute(w http.ResponseWriter, r *http.Request, orderID string) {
+	if h.routeHandler == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "route service unavailable"})
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		return
+	}
+
+	orderItem, err := h.orderService.GetByID(r.Context(), orderID)
+	if err != nil {
+		if errors.Is(err, order.ErrNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := authorizeOrderAccess(r, orderItem); err != nil {
+		status := http.StatusForbidden
+		if errors.Is(err, auth.ErrUnauthorized) {
+			status = http.StatusUnauthorized
+		}
+		writeJSON(w, status, map[string]any{"error": err.Error()})
+		return
+	}
+
+	h.routeHandler.GetByOrderID(w, r, orderID)
 }
 
 func authorizeOrderAccess(r *http.Request, orderItem model.Order) error {

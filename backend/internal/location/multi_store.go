@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"uber-test/backend/internal/model"
 )
@@ -106,6 +107,36 @@ func (s *MultiStore) ListRecent(ctx context.Context, driverID string) ([]model.D
 	items, secondaryErr := s.secondary.ListRecent(ctx, driverID)
 	if secondaryErr != nil {
 		return nil, fmt.Errorf("secondary list recent: %w", secondaryErr)
+	}
+	return items, nil
+}
+
+func (s *MultiStore) ExpireInactive(ctx context.Context, cutoff time.Time) ([]model.DriverStatus, error) {
+	primaryExpired, err := s.primary.ExpireInactive(ctx, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("primary expire inactive: %w", err)
+	}
+
+	secondaryExpired, err := s.secondary.ExpireInactive(ctx, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("secondary expire inactive: %w", err)
+	}
+
+	if len(primaryExpired) == 0 && len(secondaryExpired) == 0 {
+		return nil, nil
+	}
+
+	merged := make(map[string]model.DriverStatus, len(primaryExpired)+len(secondaryExpired))
+	for _, status := range secondaryExpired {
+		merged[status.DriverID] = status
+	}
+	for _, status := range primaryExpired {
+		merged[status.DriverID] = status
+	}
+
+	items := make([]model.DriverStatus, 0, len(merged))
+	for _, status := range merged {
+		items = append(items, status)
 	}
 	return items, nil
 }

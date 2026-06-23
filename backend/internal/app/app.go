@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"time"
 
 	httpapi "uber-test/backend/internal/api/http"
 	httpmiddleware "uber-test/backend/internal/api/http/middleware"
@@ -16,20 +17,24 @@ import (
 	"uber-test/backend/internal/dispatch"
 	"uber-test/backend/internal/location"
 	"uber-test/backend/internal/order"
+	"uber-test/backend/internal/routeplan"
 	mysqlstorage "uber-test/backend/internal/storage/mysql"
 	udptransport "uber-test/backend/internal/transport/udp"
 	"uber-test/backend/internal/trip"
 )
 
 type App struct {
-	cfg        config.Config
-	logger     *slog.Logger
-	httpServer *http.Server
-	udpServer  *udptransport.Server
-	hub        *wsapi.Hub
-	store      location.Store
-	dispatch   dispatch.Store
-	db         *sql.DB
+	cfg             config.Config
+	logger          *slog.Logger
+	httpServer      *http.Server
+	udpServer       *udptransport.Server
+	hub             *wsapi.Hub
+	store           location.Store
+	locationService *location.Service
+	dispatchService *dispatch.Service
+	routeService    *routeplan.Service
+	dispatch        dispatch.Store
+	db              *sql.DB
 }
 
 func New(cfg config.Config, logger *slog.Logger) (*App, error) {
@@ -41,6 +46,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	orderStore := order.Store(order.NewMemoryStore())
 	tripStore := trip.Store(trip.NewMemoryStore())
 	dispatchStore := dispatch.Store(dispatch.NewMemoryStore())
+	routeStore := routeplan.Store(routeplan.NewMemoryStore())
 	var db *sql.DB
 
 	if cfg.MySQLEnabled {
@@ -97,6 +103,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	locationService := location.NewService(locationStore, hub, logger)
 	tripService := trip.NewService(tripStore)
 	dispatchService := dispatch.NewService(dispatchStore, orderStore, locationService, hub, logger)
+	routeService := routeplan.NewService(routeStore, hub, logger)
 	orderService := order.NewService(orderStore, locationService, tripService, dispatchService)
 
 	router := httpapi.NewRouter(httpapi.RouterDeps{
@@ -107,6 +114,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		OrderService:    orderService,
 		TripService:     tripService,
 		DispatchService: dispatchService,
+		RouteService:    routeService,
 		Hub:             hub,
 		WSReadBuffer:    cfg.WSReadBuffer,
 		WSWriteBuffer:   cfg.WSWriteBuffer,
@@ -119,11 +127,14 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 			Addr:    cfg.HTTPAddr,
 			Handler: router,
 		},
-		udpServer: udptransport.NewServer(cfg.UDPAddr, locationService, logger),
-		hub:       hub,
-		store:     locationStore,
-		dispatch:  dispatchStore,
-		db:        db,
+		udpServer:       udptransport.NewServer(cfg.UDPAddr, locationService, logger),
+		hub:             hub,
+		store:           locationStore,
+		locationService: locationService,
+		dispatchService: dispatchService,
+		routeService:    routeService,
+		dispatch:        dispatchStore,
+		db:              db,
 	}, nil
 }
 
@@ -131,6 +142,7 @@ func (a *App) Run(ctx context.Context) error {
 	errCh := make(chan error, 2)
 
 	go a.hub.Run(ctx)
+	go a.runDriverMaintenanceLoop(ctx)
 
 	go func() {
 		a.logger.Info("starting HTTP server", "addr", a.cfg.HTTPAddr)
@@ -159,6 +171,45 @@ func (a *App) Run(ctx context.Context) error {
 	defer cancel()
 
 	return a.shutdown(shutdownCtx)
+}
+
+func (a *App) runDriverMaintenanceLoop(ctx context.Context) {
+	if a.cfg.DriverSweepInterval <= 0 || a.cfg.DriverInactiveTimeout <= 0 {
+		a.logger.Info("driver maintenance loop disabled", "interval", a.cfg.DriverSweepInterval, "inactive_timeout", a.cfg.DriverInactiveTimeout)
+		return
+	}
+
+	ticker := time.NewTicker(a.cfg.DriverSweepInterval)
+	defer ticker.Stop()
+
+	a.logger.Info("starting driver maintenance loop", "interval", a.cfg.DriverSweepInterval, "inactive_timeout", a.cfg.DriverInactiveTimeout)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cutoff := time.Now().UTC().Add(-a.cfg.DriverInactiveTimeout)
+			expired, err := a.locationService.ExpireInactiveDrivers(ctx, cutoff)
+			if err != nil {
+				a.logger.Error("driver expiration scan failed", "error", err)
+			} else {
+				for _, item := range expired {
+					if a.dispatchService == nil {
+						continue
+					}
+					if err := a.dispatchService.HandleDriverExpired(ctx, item.DriverID); err != nil {
+						a.logger.Error("handle expired driver dispatch cleanup failed", "driver_id", item.DriverID, "error", err)
+					}
+				}
+			}
+
+			if a.dispatchService != nil {
+				if err := a.dispatchService.RetryTimedOutOrders(ctx, a.cfg.DispatchPendingTimeout, a.cfg.DispatchMaxRounds); err != nil {
+					a.logger.Error("dispatch retry scan failed", "error", err)
+				}
+			}
+		}
+	}
 }
 
 func (a *App) shutdown(ctx context.Context) error {

@@ -90,16 +90,17 @@ type driverAgent struct {
 	activeStepM   float64
 	arriveWithinM float64
 
-	mu          sync.Mutex
-	current     *trackedOrder
-	startedAt   time.Time
-	locationSeq int
-	currentLat  float64
-	currentLng  float64
-	idlePhase   float64
-	routeMode   string
-	routeTarget routePoint
-	routePath   []routePoint
+	mu           sync.Mutex
+	current      *trackedOrder
+	startedAt    time.Time
+	locationSeq  int
+	currentLat   float64
+	currentLng   float64
+	idlePhase    float64
+	routeMode    string
+	routeOrderID string
+	routeTarget  routePoint
+	routePath    []routePoint
 }
 
 type trackedOrder struct {
@@ -312,13 +313,22 @@ func (a *driverAgent) syncAndDriveOrder(ctx context.Context) error {
 	}
 
 	a.mu.Lock()
+	shouldClearRoute := false
 	if current == nil {
+		shouldClearRoute = a.current != nil || a.routeOrderID != ""
 		a.current = nil
 	} else if a.current == nil || a.current.Order.ID != current.ID || a.current.Order.Status != current.Status {
 		a.current = &trackedOrder{Order: *current, StatusSince: time.Now().UTC()}
 	}
 	tracked := a.current
 	a.mu.Unlock()
+
+	if shouldClearRoute {
+		a.clearRouteState()
+		if err := a.clearRoutePlan(ctx); err != nil {
+			log.Printf("%s clear route plan failed: %v", a.displayName, err)
+		}
+	}
 
 	if current == nil {
 		if !a.autoAccept {
@@ -522,11 +532,14 @@ func (a *driverAgent) nextPosition() (float64, float64, float64, float64) {
 		a.routePath = nil
 		a.currentLat, a.currentLng = moveTowards(a.currentLat, a.currentLng, targetLat, targetLng, stepM)
 	} else {
-		if a.ensureRouteLocked(mode, targetLat, targetLng) {
+		if linearDistanceMeters(a.currentLat, a.currentLng, targetLat, targetLng) <= a.arriveWithinM {
+			a.routeMode = mode
+			a.routeTarget = routePoint{Lat: targetLat, Lng: targetLng}
+			a.routePath = nil
+			a.currentLat = targetLat
+			a.currentLng = targetLng
+		} else if a.ensureRouteLocked(mode, targetLat, targetLng) {
 			a.currentLat, a.currentLng = followRoute(a.currentLat, a.currentLng, &a.routePath, stepM)
-			if len(a.routePath) == 0 {
-				a.currentLat, a.currentLng = moveTowards(a.currentLat, a.currentLng, targetLat, targetLng, stepM)
-			}
 		} else {
 			a.currentLat, a.currentLng = moveTowards(a.currentLat, a.currentLng, targetLat, targetLng, stepM)
 		}
@@ -556,9 +569,56 @@ func (a *driverAgent) ensureRouteLocked(mode string, targetLat, targetLng float6
 	}
 
 	a.routeMode = mode
+	if a.current != nil {
+		a.routeOrderID = a.current.Order.ID
+	}
 	a.routeTarget = routePoint{Lat: targetLat, Lng: targetLng}
 	a.routePath = path
+	if err := a.uploadRoutePlan(context.Background(), a.routeOrderID, mode, path); err != nil {
+		log.Printf("%s route upload failed: %v", a.displayName, err)
+	}
 	return true
+}
+
+func (a *driverAgent) clearRouteState() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.routeMode = ""
+	a.routeOrderID = ""
+	a.routeTarget = routePoint{}
+	a.routePath = nil
+}
+
+func (a *driverAgent) uploadRoutePlan(ctx context.Context, orderID, mode string, path []routePoint) error {
+	if orderID == "" {
+		return nil
+	}
+
+	points := make([]model.RoutePoint, 0, len(path))
+	for _, point := range path {
+		points = append(points, model.RoutePoint{
+			Lat: point.Lat,
+			Lng: point.Lng,
+		})
+	}
+
+	var result struct {
+		Item model.DriverRoute `json:"item"`
+	}
+	return a.decodeJSON(ctx, http.MethodPost, fmt.Sprintf("/api/v1/drivers/%s/route", a.driverID), a.token, map[string]any{
+		"order_id": orderID,
+		"mode":     mode,
+		"points":   points,
+	}, &result)
+}
+
+func (a *driverAgent) clearRoutePlan(ctx context.Context) error {
+	var result struct {
+		Item model.DriverRoute `json:"item"`
+	}
+	return a.decodeJSON(ctx, http.MethodPost, fmt.Sprintf("/api/v1/drivers/%s/route", a.driverID), a.token, map[string]any{
+		"points": []model.RoutePoint{},
+	}, &result)
 }
 
 func (a *driverAgent) fetchRoute(originLat, originLng, destinationLat, destinationLng float64) ([]routePoint, error) {
@@ -761,7 +821,6 @@ func fetchAMapDrivingRoute(client *http.Client, key string, originLat, originLng
 		points = append(points, parsePolyline(step.Polyline)...)
 	}
 	points = dedupeRoutePoints(points)
-	points = appendTerminalPoint(points, destinationLat, destinationLng)
 	if len(points) == 0 {
 		return nil, errors.New("route api returned empty polyline")
 	}
@@ -829,23 +888,10 @@ func fetchOSRMRoute(client *http.Client, baseURL string, originLat, originLng, d
 		})
 	}
 	points = dedupeRoutePoints(points)
-	points = appendTerminalPoint(points, destinationLat, destinationLng)
 	if len(points) == 0 {
 		return nil, errors.New("osrm route api returned empty geometry")
 	}
 	return points, nil
-}
-
-func appendTerminalPoint(points []routePoint, targetLat, targetLng float64) []routePoint {
-	if len(points) == 0 {
-		return []routePoint{{Lat: targetLat, Lng: targetLng}}
-	}
-
-	last := points[len(points)-1]
-	if linearDistanceMeters(last.Lat, last.Lng, targetLat, targetLng) > 1 {
-		points = append(points, routePoint{Lat: targetLat, Lng: targetLng})
-	}
-	return points
 }
 
 func outOfChina(lat, lng float64) bool {
@@ -948,8 +994,10 @@ func resolveAmapWebKey(explicit string) string {
 		filepath.Join("..", "frontend-passenger", ".env.local"),
 		filepath.Join("..", "frontend-passenger", ".env.example"),
 	} {
-		if key := readKeyFromEnvFile(candidate, "VITE_AMAP_WEB_SERVICE_KEY"); key != "" {
-			return key
+		for _, envKey := range []string{"VITE_AMAP_WEB_SERVICE_KEY", "VITE_AMAP_KEY"} {
+			if key := readKeyFromEnvFile(candidate, envKey); key != "" {
+				return key
+			}
 		}
 	}
 

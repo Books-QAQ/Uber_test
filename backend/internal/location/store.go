@@ -5,17 +5,30 @@ import (
 	"math"
 	"slices"
 	"sync"
+	"time"
+
+	"github.com/dhconnelly/rtreego"
 
 	"uber-test/backend/internal/model"
 )
 
+const (
+	rtreeDimensions   = 2
+	rtreeMinChildren  = 8
+	rtreeMaxChildren  = 16
+	rtreePointEpsilon = 0.0000001
+)
+
 type MemoryStore struct {
-	mu         sync.RWMutex
-	maxRecent  int
-	latest     map[string]model.DriverLocation
-	recentByID map[string][]model.DriverLocation
-	heartbeats map[string]model.DriverHeartbeat
-	statuses   map[string]model.DriverStatus
+	mu           sync.RWMutex
+	maxRecent    int
+	latest       map[string]model.DriverLocation
+	recentByID   map[string]*recentLocationLRU
+	heartbeats   map[string]model.DriverHeartbeat
+	activityByID map[string]time.Time
+	statuses     map[string]model.DriverStatus
+	index        *rtreego.Rtree
+	spatialByID  map[string]*driverSpatial
 }
 
 func NewMemoryStore(maxRecent int) *MemoryStore {
@@ -24,34 +37,83 @@ func NewMemoryStore(maxRecent int) *MemoryStore {
 	}
 
 	return &MemoryStore{
-		maxRecent:  maxRecent,
-		latest:     make(map[string]model.DriverLocation),
-		recentByID: make(map[string][]model.DriverLocation),
-		heartbeats: make(map[string]model.DriverHeartbeat),
-		statuses:   make(map[string]model.DriverStatus),
+		maxRecent:    maxRecent,
+		latest:       make(map[string]model.DriverLocation),
+		recentByID:   make(map[string]*recentLocationLRU),
+		heartbeats:   make(map[string]model.DriverHeartbeat),
+		activityByID: make(map[string]time.Time),
+		statuses:     make(map[string]model.DriverStatus),
+		index:        rtreego.NewTree(rtreeDimensions, rtreeMinChildren, rtreeMaxChildren),
+		spatialByID:  make(map[string]*driverSpatial),
 	}
+}
+
+type driverSpatial struct {
+	driverID string
+	rect     rtreego.Rect
+}
+
+func newDriverSpatial(location model.DriverLocation) (*driverSpatial, error) {
+	rect, err := rtreego.NewRect(
+		rtreego.Point{location.Lat, location.Lng},
+		[]float64{rtreePointEpsilon, rtreePointEpsilon},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &driverSpatial{
+		driverID: location.DriverID,
+		rect:     rect,
+	}, nil
+}
+
+func (d *driverSpatial) Bounds() rtreego.Rect {
+	return d.rect
 }
 
 func (s *MemoryStore) Upsert(_ context.Context, location model.DriverLocation) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.latest[location.DriverID] = location
-
-	recent := append(s.recentByID[location.DriverID], location)
-	if len(recent) > s.maxRecent {
-		recent = recent[len(recent)-s.maxRecent:]
-	}
-	s.recentByID[location.DriverID] = recent
-	return nil
+	return s.upsertLocked(location)
 }
 
 func (s *MemoryStore) UpsertBatch(ctx context.Context, locations []model.DriverLocation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	for _, location := range locations {
-		if err := s.Upsert(ctx, location); err != nil {
+		if err := s.upsertLocked(location); err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+func (s *MemoryStore) upsertLocked(location model.DriverLocation) error {
+	s.latest[location.DriverID] = location
+	if !location.Timestamp.IsZero() {
+		s.activityByID[location.DriverID] = location.Timestamp
+	}
+
+	recent := s.recentByID[location.DriverID]
+	if recent == nil {
+		recent = newRecentLocationLRU(s.maxRecent)
+		s.recentByID[location.DriverID] = recent
+	}
+	recent.Add(location)
+
+	if existing := s.spatialByID[location.DriverID]; existing != nil {
+		s.index.Delete(existing)
+	}
+
+	spatial, err := newDriverSpatial(location)
+	if err != nil {
+		return err
+	}
+	s.index.Insert(spatial)
+	s.spatialByID[location.DriverID] = spatial
 	return nil
 }
 
@@ -60,6 +122,9 @@ func (s *MemoryStore) TouchHeartbeat(_ context.Context, heartbeat model.DriverHe
 	defer s.mu.Unlock()
 
 	s.heartbeats[heartbeat.DriverID] = heartbeat
+	if !heartbeat.Timestamp.IsZero() {
+		s.activityByID[heartbeat.DriverID] = heartbeat.Timestamp
+	}
 	return nil
 }
 
@@ -68,6 +133,11 @@ func (s *MemoryStore) SetDriverStatus(_ context.Context, status model.DriverStat
 	defer s.mu.Unlock()
 
 	s.statuses[status.DriverID] = status
+	if status.Status != model.DriverStatusOffline && !status.UpdatedAt.IsZero() {
+		if lastActive, ok := s.activityByID[status.DriverID]; !ok || status.UpdatedAt.After(lastActive) {
+			s.activityByID[status.DriverID] = status.UpdatedAt
+		}
+	}
 	return nil
 }
 
@@ -97,10 +167,11 @@ func (s *MemoryStore) ListRecent(_ context.Context, driverID string) ([]model.Dr
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	items := s.recentByID[driverID]
-	out := make([]model.DriverLocation, len(items))
-	copy(out, items)
-	return out, nil
+	cache := s.recentByID[driverID]
+	if cache == nil {
+		return nil, nil
+	}
+	return cache.List(), nil
 }
 
 func (s *MemoryStore) FindNearby(_ context.Context, query model.NearbyQuery) ([]model.NearbyDriver, error) {
@@ -114,8 +185,25 @@ func (s *MemoryStore) FindNearby(_ context.Context, query model.NearbyQuery) ([]
 		query.Limit = 20
 	}
 
-	items := make([]model.NearbyDriver, 0, len(s.latest))
-	for driverID, location := range s.latest {
+	searchRect, err := nearbySearchRect(query.Lat, query.Lng, query.RadiusM)
+	if err != nil {
+		return nil, err
+	}
+
+	candidates := s.index.SearchIntersect(searchRect)
+	items := make([]model.NearbyDriver, 0, len(candidates))
+	for _, candidate := range candidates {
+		spatial, ok := candidate.(*driverSpatial)
+		if !ok {
+			continue
+		}
+
+		driverID := spatial.driverID
+		location, exists := s.latest[driverID]
+		if !exists {
+			continue
+		}
+
 		status, ok := s.statuses[driverID]
 		if query.OnlyLive {
 			if !ok || !model.IsDriverStatusAvailableForNearby(status.Status) {
@@ -164,8 +252,76 @@ func (s *MemoryStore) FindNearby(_ context.Context, query model.NearbyQuery) ([]
 	return items, nil
 }
 
+func (s *MemoryStore) ExpireInactive(_ context.Context, cutoff time.Time) ([]model.DriverStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	expired := make([]model.DriverStatus, 0)
+	for driverID, status := range s.statuses {
+		if status.Status == model.DriverStatusOffline {
+			continue
+		}
+
+		lastActive := s.lastActiveAtLocked(driverID)
+		if lastActive.IsZero() || lastActive.After(cutoff) {
+			continue
+		}
+
+		status.Status = model.DriverStatusOffline
+		status.UpdatedAt = cutoff
+		s.statuses[driverID] = status
+		expired = append(expired, status)
+	}
+
+	return expired, nil
+}
+
+func nearbySearchRect(lat, lng, radiusM float64) (rtreego.Rect, error) {
+	latDelta := metersToLatDegrees(radiusM)
+	lngDelta := metersToLngDegrees(radiusM, lat)
+	if latDelta <= 0 {
+		latDelta = rtreePointEpsilon
+	}
+	if lngDelta <= 0 {
+		lngDelta = rtreePointEpsilon
+	}
+
+	return rtreego.NewRect(
+		rtreego.Point{lat - latDelta, lng - lngDelta},
+		[]float64{latDelta * 2, lngDelta * 2},
+	)
+}
+
 func (s *MemoryStore) Close() error {
 	return nil
+}
+
+func metersToLatDegrees(meters float64) float64 {
+	return meters / 111320.0
+}
+
+func metersToLngDegrees(meters float64, lat float64) float64 {
+	cosLat := math.Cos(lat * math.Pi / 180)
+	if math.Abs(cosLat) < 0.000001 {
+		return meters / 111320.0
+	}
+	return meters / (111320.0 * cosLat)
+}
+
+func (s *MemoryStore) lastActiveAtLocked(driverID string) time.Time {
+	lastActive := s.activityByID[driverID]
+
+	if heartbeat, ok := s.heartbeats[driverID]; ok && heartbeat.Timestamp.After(lastActive) {
+		lastActive = heartbeat.Timestamp
+	}
+	if location, ok := s.latest[driverID]; ok && location.Timestamp.After(lastActive) {
+		lastActive = location.Timestamp
+	}
+	if status, ok := s.statuses[driverID]; ok && status.UpdatedAt.After(lastActive) {
+		lastActive = status.UpdatedAt
+	}
+
+	return lastActive
 }
 
 func haversineMeters(lat1, lng1, lat2, lng2 float64) float64 {

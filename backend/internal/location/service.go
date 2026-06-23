@@ -24,6 +24,9 @@ type Service struct {
 }
 
 func NewService(store Store, broadcaster Broadcaster, logger *slog.Logger) *Service {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &Service{
 		store:       store,
 		broadcaster: broadcaster,
@@ -122,6 +125,46 @@ func (s *Service) FindNearby(ctx context.Context, query model.NearbyQuery) ([]mo
 	query.OnlyLive = true
 
 	return s.store.FindNearby(ctx, query)
+}
+
+func (s *Service) ExpireInactiveDrivers(ctx context.Context, cutoff time.Time) ([]model.DriverStatus, error) {
+	items, err := s.store.ExpireInactive(ctx, cutoff)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, item := range items {
+		s.broadcaster.BroadcastJSON(map[string]any{
+			"type": "driver.status.expired",
+			"data": item,
+		})
+		s.logger.Info("driver marked offline due to inactivity", "driver_id", item.DriverID, "updated_at", item.UpdatedAt)
+	}
+
+	return items, nil
+}
+
+func (s *Service) RunExpirationLoop(ctx context.Context, interval, inactiveTimeout time.Duration) {
+	if interval <= 0 || inactiveTimeout <= 0 {
+		s.logger.Info("driver expiration loop disabled", "interval", interval, "inactive_timeout", inactiveTimeout)
+		return
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	s.logger.Info("starting driver expiration loop", "interval", interval, "inactive_timeout", inactiveTimeout)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cutoff := time.Now().UTC().Add(-inactiveTimeout)
+			if _, err := s.ExpireInactiveDrivers(ctx, cutoff); err != nil {
+				s.logger.Error("driver expiration scan failed", "error", err)
+			}
+		}
+	}
 }
 
 type decodedIngress struct {

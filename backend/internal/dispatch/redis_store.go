@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -70,10 +71,12 @@ func (s *RedisStore) CreateBatch(ctx context.Context, records []model.DispatchRe
 		}
 
 		pipe.Set(ctx, s.recordKey(record.ID), payload, s.ttl)
+		pipe.SAdd(ctx, s.orderKey(record.OrderID), record.ID)
 		pipe.SAdd(ctx, s.pendingOrderKey(record.OrderID), record.ID)
 		pipe.SAdd(ctx, s.pendingDriverKey(record.DriverID), record.ID)
 		pipe.Set(ctx, s.pendingOrderDriverKey(record.OrderID, record.DriverID), record.ID, s.ttl)
 		if s.ttl > 0 {
+			pipe.Expire(ctx, s.orderKey(record.OrderID), s.ttl)
 			pipe.Expire(ctx, s.pendingOrderKey(record.OrderID), s.ttl)
 			pipe.Expire(ctx, s.pendingDriverKey(record.DriverID), s.ttl)
 		}
@@ -107,6 +110,61 @@ func (s *RedisStore) ListPendingByDriverID(ctx context.Context, driverID string)
 	}
 	sortPendingDispatches(pending)
 	return pending, nil
+}
+
+func (s *RedisStore) ListPendingByOrderID(ctx context.Context, orderID string) ([]model.DispatchRecord, error) {
+	recordIDs, err := s.client.SMembers(ctx, s.pendingOrderKey(orderID)).Result()
+	if err != nil {
+		return nil, fmt.Errorf("load pending dispatch ids by order: %w", err)
+	}
+	if len(recordIDs) == 0 {
+		return nil, nil
+	}
+
+	items, err := s.loadRecords(ctx, recordIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	pending := make([]model.DispatchRecord, 0, len(items))
+	for _, item := range items {
+		if item.Status == model.DispatchStatusPending {
+			pending = append(pending, item)
+		}
+	}
+	sortPendingDispatches(pending)
+	return pending, nil
+}
+
+func (s *RedisStore) ListByOrderID(ctx context.Context, orderID string) ([]model.DispatchRecord, error) {
+	recordIDs, err := s.client.SMembers(ctx, s.orderKey(orderID)).Result()
+	if err != nil {
+		return nil, fmt.Errorf("load dispatch ids by order: %w", err)
+	}
+	if len(recordIDs) == 0 {
+		return nil, nil
+	}
+
+	items, err := s.loadRecords(ctx, recordIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	slices.SortFunc(items, func(a, b model.DispatchRecord) int {
+		switch {
+		case a.DispatchRound > b.DispatchRound:
+			return -1
+		case a.DispatchRound < b.DispatchRound:
+			return 1
+		case a.CreatedAt.After(b.CreatedAt):
+			return -1
+		case a.CreatedAt.Before(b.CreatedAt):
+			return 1
+		default:
+			return 0
+		}
+	})
+	return items, nil
 }
 
 func (s *RedisStore) GetPendingByOrderAndDriver(ctx context.Context, orderID, driverID string) (model.DispatchRecord, error) {
@@ -154,6 +212,51 @@ func (s *RedisStore) UpdatePendingStatusByOrderID(ctx context.Context, orderID, 
 		record.UpdatedAt = updatedAt
 		record.RespondedAt = updatedAt
 	}, false, "")
+}
+
+func (s *RedisStore) UpdatePendingStatusByDriverID(ctx context.Context, driverID, status string, updatedAt time.Time) error {
+	recordIDs, err := s.client.SMembers(ctx, s.pendingDriverKey(driverID)).Result()
+	if err != nil {
+		return fmt.Errorf("load pending driver dispatch ids: %w", err)
+	}
+	if len(recordIDs) == 0 {
+		return nil
+	}
+
+	items, err := s.loadRecords(ctx, recordIDs)
+	if err != nil {
+		return err
+	}
+
+	pipe := s.client.Pipeline()
+	for _, item := range items {
+		if item.DriverID != driverID || item.Status != model.DispatchStatusPending {
+			continue
+		}
+
+		item.Status = status
+		item.UpdatedAt = updatedAt
+		item.RespondedAt = updatedAt
+
+		payload, marshalErr := json.Marshal(item)
+		if marshalErr != nil {
+			return fmt.Errorf("marshal updated driver dispatch record: %w", marshalErr)
+		}
+
+		pipe.Set(ctx, s.recordKey(item.ID), payload, s.ttl)
+		pipe.SRem(ctx, s.pendingDriverKey(item.DriverID), item.ID)
+		pipe.SRem(ctx, s.pendingOrderKey(item.OrderID), item.ID)
+		pipe.Del(ctx, s.pendingOrderDriverKey(item.OrderID, item.DriverID))
+		if s.ttl > 0 {
+			pipe.Expire(ctx, s.pendingOrderKey(item.OrderID), s.ttl)
+			pipe.Expire(ctx, s.pendingDriverKey(item.DriverID), s.ttl)
+		}
+	}
+
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("update redis dispatch records by driver: %w", err)
+	}
+	return nil
 }
 
 func (s *RedisStore) Close() error {
@@ -256,6 +359,10 @@ func (s *RedisStore) loadRecords(ctx context.Context, recordIDs []string) ([]mod
 
 func (s *RedisStore) recordKey(recordID string) string {
 	return s.key("dispatch:record:" + recordID)
+}
+
+func (s *RedisStore) orderKey(orderID string) string {
+	return s.key("dispatch:order:" + orderID)
 }
 
 func (s *RedisStore) pendingOrderKey(orderID string) string {

@@ -13,9 +13,12 @@ import (
 type Store interface {
 	CreateBatch(ctx context.Context, records []model.DispatchRecord) error
 	ListPendingByDriverID(ctx context.Context, driverID string) ([]model.DispatchRecord, error)
+	ListPendingByOrderID(ctx context.Context, orderID string) ([]model.DispatchRecord, error)
+	ListByOrderID(ctx context.Context, orderID string) ([]model.DispatchRecord, error)
 	GetPendingByOrderAndDriver(ctx context.Context, orderID, driverID string) (model.DispatchRecord, error)
 	MarkAccepted(ctx context.Context, orderID, driverID string, acceptedAt time.Time) error
 	UpdatePendingStatusByOrderID(ctx context.Context, orderID, status string, updatedAt time.Time) error
+	UpdatePendingStatusByDriverID(ctx context.Context, driverID, status string, updatedAt time.Time) error
 	Close() error
 }
 
@@ -62,6 +65,49 @@ func (s *MemoryStore) ListPendingByDriverID(_ context.Context, driverID string) 
 	}
 
 	sortPendingDispatches(items)
+	return items, nil
+}
+
+func (s *MemoryStore) ListPendingByOrderID(_ context.Context, orderID string) ([]model.DispatchRecord, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	items := make([]model.DispatchRecord, 0)
+	for _, record := range s.records {
+		if record.OrderID == orderID && record.Status == model.DispatchStatusPending {
+			items = append(items, record)
+		}
+	}
+
+	sortPendingDispatches(items)
+	return items, nil
+}
+
+func (s *MemoryStore) ListByOrderID(_ context.Context, orderID string) ([]model.DispatchRecord, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	items := make([]model.DispatchRecord, 0)
+	for _, record := range s.records {
+		if record.OrderID == orderID {
+			items = append(items, record)
+		}
+	}
+
+	slices.SortFunc(items, func(a, b model.DispatchRecord) int {
+		switch {
+		case a.DispatchRound > b.DispatchRound:
+			return -1
+		case a.DispatchRound < b.DispatchRound:
+			return 1
+		case a.CreatedAt.After(b.CreatedAt):
+			return -1
+		case a.CreatedAt.Before(b.CreatedAt):
+			return 1
+		default:
+			return 0
+		}
+	})
 	return items, nil
 }
 
@@ -112,6 +158,23 @@ func (s *MemoryStore) UpdatePendingStatusByOrderID(_ context.Context, orderID, s
 
 	for id, record := range s.records {
 		if record.OrderID != orderID || record.Status != model.DispatchStatusPending {
+			continue
+		}
+		record.Status = status
+		record.UpdatedAt = updatedAt
+		record.RespondedAt = updatedAt
+		s.records[id] = record
+	}
+
+	return nil
+}
+
+func (s *MemoryStore) UpdatePendingStatusByDriverID(_ context.Context, driverID, status string, updatedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for id, record := range s.records {
+		if record.DriverID != driverID || record.Status != model.DispatchStatusPending {
 			continue
 		}
 		record.Status = status

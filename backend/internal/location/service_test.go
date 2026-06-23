@@ -152,6 +152,75 @@ func TestServiceFindNearbyReturnsOnlyOnlineDrivers(t *testing.T) {
 	}
 }
 
+func TestServiceExpireInactiveDriversMarksOffline(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemoryStore(10)
+	broadcaster := &stubBroadcaster{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := NewService(store, broadcaster, logger)
+
+	now := time.Date(2026, 6, 23, 0, 0, 0, 0, time.UTC)
+	for _, driverID := range []string{"driver-stale", "driver-fresh"} {
+		if err := service.SetDriverStatus(context.Background(), model.DriverStatus{
+			DriverID:  driverID,
+			Status:    model.DriverStatusOnline,
+			UpdatedAt: now.Add(-20 * time.Minute),
+		}); err != nil {
+			t.Fatalf("set status for %s: %v", driverID, err)
+		}
+	}
+
+	if err := store.Upsert(context.Background(), model.DriverLocation{
+		DriverID:  "driver-stale",
+		Lat:       31.2304,
+		Lng:       121.4737,
+		Timestamp: now.Add(-16 * time.Minute),
+	}); err != nil {
+		t.Fatalf("upsert stale driver: %v", err)
+	}
+	if err := store.Upsert(context.Background(), model.DriverLocation{
+		DriverID:  "driver-fresh",
+		Lat:       31.2305,
+		Lng:       121.4738,
+		Timestamp: now.Add(-2 * time.Minute),
+	}); err != nil {
+		t.Fatalf("upsert fresh driver: %v", err)
+	}
+
+	expired, err := service.ExpireInactiveDrivers(context.Background(), now.Add(-15*time.Minute))
+	if err != nil {
+		t.Fatalf("expire inactive drivers: %v", err)
+	}
+	if len(expired) != 1 {
+		t.Fatalf("expected 1 expired driver, got %d", len(expired))
+	}
+	if expired[0].DriverID != "driver-stale" || expired[0].Status != model.DriverStatusOffline {
+		t.Fatalf("unexpected expired driver payload: %+v", expired[0])
+	}
+
+	items, err := service.FindNearby(context.Background(), model.NearbyQuery{
+		Lat:     31.2304,
+		Lng:     121.4737,
+		RadiusM: 500,
+		Limit:   10,
+	})
+	if err != nil {
+		t.Fatalf("find nearby after expiration: %v", err)
+	}
+	if len(items) != 1 || items[0].DriverID != "driver-fresh" {
+		t.Fatalf("expected only fresh driver nearby after expiration, got %+v", items)
+	}
+
+	if len(broadcaster.payloads) == 0 {
+		t.Fatalf("expected expiration broadcast event")
+	}
+	lastPayload := broadcaster.payloads[len(broadcaster.payloads)-1]
+	if eventType, _ := lastPayload["type"].(string); eventType != "driver.status.expired" {
+		t.Fatalf("unexpected expiration event type: %v", lastPayload["type"])
+	}
+}
+
 type testLocationInput struct {
 	driverID string
 	lat      float64

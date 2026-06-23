@@ -130,3 +130,79 @@ func TestRedisStoreMarkAccepted(t *testing.T) {
 		t.Fatalf("expected ErrNotFound for expired pending dispatch, got %v", err)
 	}
 }
+
+func TestRedisStoreUpdatePendingStatusByDriverID(t *testing.T) {
+	t.Parallel()
+
+	mini, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("start miniredis: %v", err)
+	}
+	defer mini.Close()
+
+	store, err := NewRedisStore(context.Background(), RedisConfig{
+		Addr:      mini.Addr(),
+		KeyPrefix: "test",
+		TTL:       time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("new redis dispatch store: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Date(2026, 6, 23, 1, 10, 0, 0, time.UTC)
+	if err := store.CreateBatch(context.Background(), []model.DispatchRecord{
+		{
+			ID:            "dispatch-1",
+			OrderID:       "order-1",
+			DriverID:      "driver-1",
+			Status:        model.DispatchStatusPending,
+			DistanceM:     100,
+			DispatchRound: 1,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		},
+		{
+			ID:            "dispatch-2",
+			OrderID:       "order-2",
+			DriverID:      "driver-1",
+			Status:        model.DispatchStatusPending,
+			DistanceM:     120,
+			DispatchRound: 1,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		},
+		{
+			ID:            "dispatch-3",
+			OrderID:       "order-3",
+			DriverID:      "driver-2",
+			Status:        model.DispatchStatusPending,
+			DistanceM:     140,
+			DispatchRound: 1,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		},
+	}); err != nil {
+		t.Fatalf("create batch: %v", err)
+	}
+
+	if err := store.UpdatePendingStatusByDriverID(context.Background(), "driver-1", model.DispatchStatusExpired, now.Add(2*time.Second)); err != nil {
+		t.Fatalf("update pending by driver: %v", err)
+	}
+
+	items, err := store.ListPendingByDriverID(context.Background(), "driver-1")
+	if err != nil {
+		t.Fatalf("list pending for expired driver: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("expected no pending records for expired driver, got %d", len(items))
+	}
+
+	otherItems, err := store.ListPendingByDriverID(context.Background(), "driver-2")
+	if err != nil {
+		t.Fatalf("list pending for other driver: %v", err)
+	}
+	if len(otherItems) != 1 || otherItems[0].ID != "dispatch-3" {
+		t.Fatalf("expected other driver's pending record to remain, got %+v", otherItems)
+	}
+}

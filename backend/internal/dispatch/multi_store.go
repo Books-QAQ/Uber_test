@@ -49,6 +49,38 @@ func (s *MultiStore) ListPendingByDriverID(ctx context.Context, driverID string)
 	return items, nil
 }
 
+func (s *MultiStore) ListPendingByOrderID(ctx context.Context, orderID string) ([]model.DispatchRecord, error) {
+	items, err := s.cache.ListPendingByOrderID(ctx, orderID)
+	if err == nil && len(items) > 0 {
+		return items, nil
+	}
+	if err != nil {
+		s.logger.Warn("dispatch cache read by order failed, falling back to persistent store", "order_id", orderID, "error", err)
+	}
+
+	items, persistentErr := s.persistent.ListPendingByOrderID(ctx, orderID)
+	if persistentErr != nil {
+		return nil, fmt.Errorf("persistent dispatch list by order: %w", persistentErr)
+	}
+	return items, nil
+}
+
+func (s *MultiStore) ListByOrderID(ctx context.Context, orderID string) ([]model.DispatchRecord, error) {
+	items, err := s.cache.ListByOrderID(ctx, orderID)
+	if err == nil && len(items) > 0 {
+		return items, nil
+	}
+	if err != nil {
+		s.logger.Warn("dispatch cache history read by order failed, falling back to persistent store", "order_id", orderID, "error", err)
+	}
+
+	items, persistentErr := s.persistent.ListByOrderID(ctx, orderID)
+	if persistentErr != nil {
+		return nil, fmt.Errorf("persistent dispatch list history by order: %w", persistentErr)
+	}
+	return items, nil
+}
+
 func (s *MultiStore) GetPendingByOrderAndDriver(ctx context.Context, orderID, driverID string) (model.DispatchRecord, error) {
 	item, err := s.cache.GetPendingByOrderAndDriver(ctx, orderID, driverID)
 	if err == nil {
@@ -81,6 +113,16 @@ func (s *MultiStore) UpdatePendingStatusByOrderID(ctx context.Context, orderID, 
 	}
 	if err := s.cache.UpdatePendingStatusByOrderID(ctx, orderID, status, updatedAt); err != nil {
 		return fmt.Errorf("cache update dispatch status by order: %w", err)
+	}
+	return nil
+}
+
+func (s *MultiStore) UpdatePendingStatusByDriverID(ctx context.Context, driverID, status string, updatedAt time.Time) error {
+	if err := s.persistent.UpdatePendingStatusByDriverID(ctx, driverID, status, updatedAt); err != nil {
+		return fmt.Errorf("persistent update dispatch status by driver: %w", err)
+	}
+	if err := s.cache.UpdatePendingStatusByDriverID(ctx, driverID, status, updatedAt); err != nil {
+		return fmt.Errorf("cache update dispatch status by driver: %w", err)
 	}
 	return nil
 }

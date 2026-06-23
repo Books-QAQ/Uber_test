@@ -23,6 +23,7 @@ type NearbyFinder interface {
 
 type OrderReader interface {
 	GetByID(ctx context.Context, id string) (model.Order, error)
+	List(ctx context.Context) ([]model.Order, error)
 }
 
 type Broadcaster interface {
@@ -51,11 +52,18 @@ func NewService(store Store, orders OrderReader, nearby NearbyFinder, broadcaste
 }
 
 func (s *Service) DispatchOrder(ctx context.Context, order model.Order) error {
+	return s.dispatchOrderWithRound(ctx, order, defaultDispatchRound)
+}
+
+func (s *Service) dispatchOrderWithRound(ctx context.Context, order model.Order, dispatchRound int) error {
 	if s == nil || s.store == nil || s.nearby == nil {
 		return nil
 	}
 	if order.ID == "" {
 		return fmt.Errorf("dispatch order: missing order id")
+	}
+	if dispatchRound <= 0 {
+		dispatchRound = defaultDispatchRound
 	}
 
 	drivers, err := s.nearby.FindNearby(ctx, model.NearbyQuery{
@@ -81,7 +89,7 @@ func (s *Service) DispatchOrder(ctx context.Context, order model.Order) error {
 			DriverID:      driver.DriverID,
 			Status:        model.DispatchStatusPending,
 			DistanceM:     driver.DistanceM,
-			DispatchRound: defaultDispatchRound,
+			DispatchRound: dispatchRound,
 			CreatedAt:     now,
 			UpdatedAt:     now,
 		})
@@ -196,6 +204,192 @@ func (s *Service) ClosePendingByOrderID(ctx context.Context, orderID, status str
 		"at":       now,
 	})
 	return nil
+}
+
+func (s *Service) ClosePendingByDriverID(ctx context.Context, driverID, status string) error {
+	if s == nil || s.store == nil {
+		return nil
+	}
+	if driverID == "" {
+		return fmt.Errorf("close pending dispatches: missing driver_id")
+	}
+	if status == "" {
+		status = model.DispatchStatusExpired
+	}
+
+	records, err := s.store.ListPendingByDriverID(ctx, driverID)
+	if err != nil {
+		return err
+	}
+	if len(records) == 0 {
+		return nil
+	}
+
+	now := time.Now().UTC()
+	if err := s.store.UpdatePendingStatusByDriverID(ctx, driverID, status, now); err != nil {
+		return err
+	}
+
+	orderIDs := make([]string, 0, len(records))
+	for _, record := range records {
+		orderIDs = append(orderIDs, record.OrderID)
+	}
+
+	s.broadcast(map[string]any{
+		"type":      "dispatch.driver.closed",
+		"driver_id": driverID,
+		"status":    status,
+		"count":     len(records),
+		"order_ids": orderIDs,
+		"at":        now,
+	})
+	return nil
+}
+
+func (s *Service) HandleDriverExpired(ctx context.Context, driverID string) error {
+	if s == nil || s.store == nil {
+		return nil
+	}
+	if driverID == "" {
+		return fmt.Errorf("handle expired driver: missing driver_id")
+	}
+
+	records, err := s.store.ListPendingByDriverID(ctx, driverID)
+	if err != nil {
+		return err
+	}
+	if len(records) == 0 {
+		return nil
+	}
+
+	orderIDs := make(map[string]struct{}, len(records))
+	for _, record := range records {
+		orderIDs[record.OrderID] = struct{}{}
+	}
+
+	if err := s.ClosePendingByDriverID(ctx, driverID, model.DispatchStatusExpired); err != nil {
+		return err
+	}
+
+	for orderID := range orderIDs {
+		pending, err := s.store.ListPendingByOrderID(ctx, orderID)
+		if err != nil {
+			return err
+		}
+		if len(pending) > 0 {
+			continue
+		}
+		if s.orders == nil {
+			continue
+		}
+
+		order, err := s.orders.GetByID(ctx, orderID)
+		if err != nil {
+			s.logger.Warn("skip redispatch for missing order after driver expiration", "order_id", orderID, "driver_id", driverID, "error", err)
+			continue
+		}
+		if order.Status != model.OrderStatusPendingDispatch {
+			continue
+		}
+		nextRound, err := s.nextDispatchRound(ctx, orderID)
+		if err != nil {
+			return err
+		}
+		if err := s.dispatchOrderWithRound(ctx, order, nextRound); err != nil {
+			return err
+		}
+		s.logger.Info("redispatched order after driver expiration", "order_id", orderID, "driver_id", driverID)
+	}
+
+	return nil
+}
+
+func (s *Service) RetryTimedOutOrders(ctx context.Context, pendingTimeout time.Duration, maxRounds int) error {
+	if s == nil || s.store == nil || s.orders == nil {
+		return nil
+	}
+	if pendingTimeout <= 0 {
+		return nil
+	}
+	if maxRounds <= 0 {
+		maxRounds = 1
+	}
+
+	seenOrders := make(map[string]struct{})
+	allOrders, err := s.orders.List(ctx)
+	if err != nil {
+		return err
+	}
+
+	cutoff := time.Now().UTC().Add(-pendingTimeout)
+	for _, order := range allOrders {
+		if order.Status != model.OrderStatusPendingDispatch {
+			continue
+		}
+		if _, seen := seenOrders[order.ID]; seen {
+			continue
+		}
+
+		pending, err := s.store.ListPendingByOrderID(ctx, order.ID)
+		if err != nil {
+			return err
+		}
+		if len(pending) == 0 {
+			continue
+		}
+
+		latestPendingAt := latestPendingUpdatedAt(pending)
+		if latestPendingAt.After(cutoff) {
+			continue
+		}
+
+		nextRound, err := s.nextDispatchRound(ctx, order.ID)
+		if err != nil {
+			return err
+		}
+		if nextRound > maxRounds {
+			continue
+		}
+
+		if err := s.ClosePendingByOrderID(ctx, order.ID, model.DispatchStatusExpired); err != nil {
+			return err
+		}
+		if err := s.dispatchOrderWithRound(ctx, order, nextRound); err != nil {
+			return err
+		}
+		seenOrders[order.ID] = struct{}{}
+		s.logger.Info("redispatched timed-out order", "order_id", order.ID, "next_round", nextRound)
+	}
+
+	return nil
+}
+
+func (s *Service) nextDispatchRound(ctx context.Context, orderID string) (int, error) {
+	records, err := s.store.ListByOrderID(ctx, orderID)
+	if err != nil {
+		return 0, err
+	}
+
+	maxRound := 0
+	for _, record := range records {
+		if record.DispatchRound > maxRound {
+			maxRound = record.DispatchRound
+		}
+	}
+	if maxRound == 0 {
+		return defaultDispatchRound, nil
+	}
+	return maxRound + 1, nil
+}
+
+func latestPendingUpdatedAt(records []model.DispatchRecord) time.Time {
+	var latest time.Time
+	for _, record := range records {
+		if record.UpdatedAt.After(latest) {
+			latest = record.UpdatedAt
+		}
+	}
+	return latest
 }
 
 func (s *Service) broadcast(payload any) {

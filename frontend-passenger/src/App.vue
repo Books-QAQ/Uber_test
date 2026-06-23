@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 
 import LiveMap from "./components/LiveMap.vue";
-import type { DriverLiveLocation, LoginResult, NearbyDriver, Order, SocketEvent, Trip, User } from "./types";
+import type { DriverLiveLocation, DriverRoute, LoginResult, NearbyDriver, Order, SocketEvent, Trip, User } from "./types";
 
 const storageKey = "passenger-lab-session";
 
@@ -24,8 +24,11 @@ const selectedOrderId = ref("");
 const selectedTrip = ref<Trip | null>(null);
 const socketEvents = ref<Array<{ id: number; text: string }>>([]);
 const liveDriverLocations = ref<Record<string, DriverLiveLocation>>({});
+const liveRoutes = ref<Record<string, DriverRoute>>({});
 const ws = ref<WebSocket | null>(null);
 let pollTimer: number | null = null;
+let nearbyRefreshTimer: number | null = null;
+let ordersRefreshTimer: number | null = null;
 let eventSeq = 0;
 
 const session = reactive<{
@@ -90,6 +93,57 @@ const mapPickupLat = computed(() => selectedOrder.value?.pickup_lat ?? orderForm
 const mapPickupLng = computed(() => selectedOrder.value?.pickup_lng ?? orderForm.pickup_lng);
 const mapDestinationLat = computed(() => selectedOrder.value?.destination_lat ?? orderForm.destination_lat);
 const mapDestinationLng = computed(() => selectedOrder.value?.destination_lng ?? orderForm.destination_lng);
+const totalRouteDistanceM = computed(() =>
+  distanceMeters(mapPickupLat.value, mapPickupLng.value, mapDestinationLat.value, mapDestinationLng.value),
+);
+const selectedOrderRoute = computed(() => {
+  const order = selectedOrder.value;
+  if (!order) {
+    return null;
+  }
+  return liveRoutes.value[order.id] ?? null;
+});
+const routeProgressCard = computed(() => {
+  const order = selectedOrder.value;
+  if (!order?.driver_id) {
+    return {
+      title: "司机正在赶来",
+      value: "--",
+      hint: "等待司机接单后显示",
+    };
+  }
+
+  const live = liveDriverLocations.value[order.driver_id];
+  if (!live) {
+    return {
+      title: order.status === "in_trip" ? "剩余路程" : "司机正在赶来",
+      value: "--",
+      hint: "等待司机位置更新",
+    };
+  }
+
+  if (order.status === "in_trip") {
+    return {
+      title: "剩余路程",
+      value: formatDistance(distanceMeters(live.lat, live.lng, order.destination_lat, order.destination_lng)),
+      hint: "司机已接到乘客，正在前往目的地",
+    };
+  }
+
+  if (["completed", "to_be_paid", "paid"].includes(order.status)) {
+    return {
+      title: "剩余路程",
+      value: "已到达",
+      hint: "当前行程已结束",
+    };
+  }
+
+  return {
+    title: "司机正在赶来",
+    value: formatDistance(distanceMeters(live.lat, live.lng, order.pickup_lat, order.pickup_lng)),
+    hint: "司机距上车点的当前距离",
+  };
+});
 const displayDrivers = computed(() => {
   const items = [...mergedDrivers.value];
   const seen = new Set(items.map((driver) => driver.driver_id));
@@ -135,6 +189,23 @@ const displayDrivers = computed(() => {
   return items;
 });
 
+function distanceMeters(fromLat: number, fromLng: number, toLat: number, toLng: number) {
+  const midLatRad = ((fromLat + toLat) / 2) * Math.PI / 180;
+  const lngMeters = (toLng - fromLng) * 111320 * Math.cos(midLatRad);
+  const latMeters = (toLat - fromLat) * 111320;
+  return Math.hypot(latMeters, lngMeters);
+}
+
+function formatDistance(distanceM: number) {
+  if (!Number.isFinite(distanceM) || distanceM < 0) {
+    return "--";
+  }
+  if (distanceM >= 1000) {
+    return `${(distanceM / 1000).toFixed(2)}km`;
+  }
+  return `${Math.round(distanceM)}m`;
+}
+
 onMounted(() => {
   restoreSession();
   if (isAuthenticated.value) {
@@ -152,7 +223,7 @@ watch(selectedOrderId, async (next) => {
     selectedTrip.value = null;
     return;
   }
-  await loadTrip(next);
+  await Promise.all([loadTrip(next), loadOrderRoute(next)]);
 });
 
 async function bootstrapAuthedView() {
@@ -325,6 +396,21 @@ async function loadTrip(orderId: string) {
   }
 }
 
+async function loadOrderRoute(orderId: string) {
+  if (!orderId || !isAuthenticated.value) return;
+  try {
+    const result = await api<{ item: DriverRoute }>(`/api/v1/orders/${orderId}/route`);
+    liveRoutes.value = {
+      ...liveRoutes.value,
+      [orderId]: result.item,
+    };
+  } catch {
+    const nextRoutes = { ...liveRoutes.value };
+    delete nextRoutes[orderId];
+    liveRoutes.value = nextRoutes;
+  }
+}
+
 function startDraftOrder() {
   if (draftMode.value && !selectedOrderId.value) {
     return;
@@ -384,6 +470,14 @@ function stopPolling() {
     window.clearInterval(pollTimer);
     pollTimer = null;
   }
+  if (nearbyRefreshTimer !== null) {
+    window.clearTimeout(nearbyRefreshTimer);
+    nearbyRefreshTimer = null;
+  }
+  if (ordersRefreshTimer !== null) {
+    window.clearTimeout(ordersRefreshTimer);
+    ordersRefreshTimer = null;
+  }
 }
 
 function handleSocketEvent(event: SocketEvent) {
@@ -405,10 +499,76 @@ function handleSocketEvent(event: SocketEvent) {
     }
   }
 
-  if (event.type?.startsWith("dispatch.") || event.type?.startsWith("driver.location")) {
-    void loadOrders();
-    void loadNearby();
+  if (event.type === "driver.route.updated" && isRecord(event.data)) {
+    const orderId = String(event.data.order_id ?? "");
+    if (orderId) {
+      liveRoutes.value = {
+        ...liveRoutes.value,
+        [orderId]: {
+          driver_id: String(event.data.driver_id ?? ""),
+          order_id: orderId,
+          mode: String(event.data.mode ?? ""),
+          updated_at: String(event.data.updated_at ?? new Date().toISOString()),
+          points: Array.isArray(event.data.points)
+            ? event.data.points
+                .filter(isRecord)
+                .map((point) => ({
+                  lat: Number(point.lat ?? 0),
+                  lng: Number(point.lng ?? 0),
+                }))
+            : [],
+        },
+      };
+    }
   }
+
+  if (event.type === "driver.route.cleared" && isRecord(event.data)) {
+    const orderId = String(event.data.order_id ?? "");
+    if (orderId && liveRoutes.value[orderId]) {
+      const nextRoutes = { ...liveRoutes.value };
+      delete nextRoutes[orderId];
+      liveRoutes.value = nextRoutes;
+    }
+  }
+
+  if (event.type?.startsWith("dispatch.")) {
+    scheduleLoadOrders(150);
+    scheduleLoadNearby(300);
+    if (selectedOrderId.value) {
+      scheduleLoadRoute(selectedOrderId.value, 300);
+    }
+    return;
+  }
+
+  if (event.type?.startsWith("driver.location")) {
+    scheduleLoadNearby(1200);
+  }
+}
+
+function scheduleLoadRoute(orderId: string, delayMs = 0) {
+  window.setTimeout(() => {
+    void loadOrderRoute(orderId);
+  }, delayMs);
+}
+
+function scheduleLoadOrders(delayMs = 0) {
+  if (ordersRefreshTimer !== null) {
+    window.clearTimeout(ordersRefreshTimer);
+  }
+  ordersRefreshTimer = window.setTimeout(() => {
+    ordersRefreshTimer = null;
+    void loadOrders();
+  }, delayMs);
+}
+
+function scheduleLoadNearby(delayMs = 0) {
+  if (nearbyRefreshTimer !== null) {
+    return;
+  }
+  nearbyRefreshTimer = window.setTimeout(() => {
+    nearbyRefreshTimer = null;
+    void loadNearby();
+  }, delayMs);
 }
 
 function pushEvent(text: string) {
@@ -441,6 +601,7 @@ function logout() {
   selectedOrderId.value = "";
   selectedTrip.value = null;
   liveDriverLocations.value = {};
+  liveRoutes.value = {};
   localStorage.removeItem(storageKey);
   disconnectSocket();
   stopPolling();
@@ -623,6 +784,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
           :destination-lng="mapDestinationLng"
           :drivers="displayDrivers"
           :live-driver-locations="liveDriverLocations"
+          :actual-route="selectedOrderRoute"
           :current-order="selectedOrder"
           :pick-mode="mapPickMode"
           @pick-location="onMapPicked"
@@ -631,10 +793,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
         />
 
         <div class="driver-strip">
-          <article v-for="driver in displayDrivers" :key="driver.driver_id" class="driver-chip">
-            <strong>{{ driver.driver_id }}</strong>
-            <span>{{ driver.status }}</span>
-            <em>{{ Math.round(driver.distance_m) }}m</em>
+          <article class="driver-chip metric-chip">
+            <span class="metric-label">总路程</span>
+            <strong>{{ formatDistance(totalRouteDistanceM) }}</strong>
+            <em>上车点到目的地的预计距离</em>
+          </article>
+          <article class="driver-chip metric-chip">
+            <span class="metric-label">{{ routeProgressCard.title }}</span>
+            <strong>{{ routeProgressCard.value }}</strong>
+            <em>{{ routeProgressCard.hint }}</em>
           </article>
           <p v-if="displayDrivers.length === 0" class="empty-hint">还没有附近司机。启动司机模拟器后这里就会热起来。</p>
         </div>
@@ -775,16 +942,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
         <p v-else class="empty-hint">左侧选中一条订单，这里会显示更完整的状态和费用信息。</p>
       </section>
 
-      <section class="panel feed-panel">
-        <div class="panel-head">
-          <h2>实时事件流</h2>
-          <span class="feed-count">{{ socketEvents.length }} 条</span>
-        </div>
-        <div class="feed-list">
-          <article v-for="event in socketEvents" :key="event.id" class="feed-item">{{ event.text }}</article>
-          <p v-if="socketEvents.length === 0" class="empty-hint">连接 WebSocket 后，这里会持续滚动位置和派单消息。</p>
-        </div>
-      </section>
     </main>
   </div>
 </template>
@@ -875,8 +1032,7 @@ h1 {
   backdrop-filter: blur(18px);
 }
 
-.map-panel,
-.detail-panel {
+.map-panel {
   grid-column: span 2;
 }
 
@@ -1040,6 +1196,21 @@ input:focus {
   font-style: normal;
 }
 
+.metric-chip {
+  flex: 1 1 220px;
+  min-width: 220px;
+}
+
+.metric-label {
+  font-size: 13px;
+  letter-spacing: 0.04em;
+}
+
+.metric-chip strong {
+  font-size: 30px;
+  line-height: 1.1;
+}
+
 .order-form .pair {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -1072,7 +1243,6 @@ input:focus {
 
 .order-row span,
 .order-row em,
-.feed-count,
 .empty-hint,
 .detail-grid dt,
 .detail-summary p {
@@ -1105,7 +1275,7 @@ input:focus {
 
 .detail-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: 1fr;
   gap: 12px;
   margin: 0;
 }
@@ -1133,33 +1303,21 @@ input:focus {
   flex-wrap: wrap;
 }
 
-.feed-list {
-  display: grid;
-  gap: 10px;
-  max-height: 420px;
-  overflow: auto;
-}
-
-.feed-item {
-  padding: 14px 16px;
-  border-radius: 18px;
-  background: rgba(255, 255, 255, 0.72);
-  border: 1px solid var(--line);
-  line-height: 1.5;
-}
-
 @media (max-width: 1180px) {
   .grid {
     grid-template-columns: 1fr;
   }
 
-  .map-panel,
-  .detail-panel {
+  .map-panel {
     grid-column: span 1;
   }
 
   .coordinate-grid,
   .detail-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .coordinate-grid {
     grid-template-columns: 1fr 1fr;
   }
 }

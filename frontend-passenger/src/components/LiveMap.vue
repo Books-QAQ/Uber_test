@@ -2,7 +2,7 @@
 import AMapLoader from "@amap/amap-jsapi-loader";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
-import type { DriverLiveLocation, NearbyDriver, Order } from "../types";
+import type { DriverLiveLocation, DriverRoute, NearbyDriver, Order } from "../types";
 
 type MapClickPayload = {
   mode: "pickup" | "destination";
@@ -17,6 +17,7 @@ const props = defineProps<{
   destinationLng: number;
   drivers: NearbyDriver[];
   liveDriverLocations: Record<string, DriverLiveLocation>;
+  actualRoute: DriverRoute | null;
   pickMode: "pickup" | "destination";
   currentOrder: Order | null;
 }>();
@@ -35,9 +36,9 @@ const amapKey = (import.meta.env.VITE_AMAP_KEY as string | undefined)?.trim() ??
 const amapSecurityJsCode = (import.meta.env.VITE_AMAP_SECURITY_JS_CODE as string | undefined)?.trim() ?? "";
 const amapStyle = (import.meta.env.VITE_AMAP_MAP_STYLE as string | undefined)?.trim() || "amap://styles/normal";
 const autoFitCooldownMs = 60_000;
-const routeRefreshCooldownMs = 8_000;
-const routeRefreshMinMovementM = 80;
 const driverAnimationDurationMs = 700;
+const routeDeviationRefreshM = 20;
+const routeDeviationCooldownMs = 4_000;
 
 let map: any = null;
 let AMap: any = null;
@@ -49,11 +50,19 @@ let driverMarkers = new Map<string, any>();
 let clickHandler: ((event: any) => void) | null = null;
 let lastFitAt = 0;
 let pendingFitTimer: number | null = null;
-let pendingRouteTimer: number | null = null;
-let lastRouteSearchAt = 0;
 let routeSignature = "";
-let lastRouteOrigin: [number, number] | null = null;
 let activeRouteRequestId = 0;
+let plannedRoutePath: Array<[number, number]> = [];
+let consumedRouteIndex = 0;
+let lastRouteRefreshAt = 0;
+
+type RoutePlan = {
+  origin: [number, number];
+  destination: [number, number];
+  mode: "preview" | "pickup" | "trip";
+  signature: string;
+  driverPosition?: [number, number];
+};
 
 const mergedDrivers = computed(() =>
   props.drivers.map((driver) => {
@@ -130,6 +139,7 @@ onMounted(async () => {
       hideMarkers: true,
       autoFitView: false,
       showTraffic: false,
+      policy: AMap?.DrivingPolicy?.LEAST_TIME,
     });
 
     syncMarkers();
@@ -151,10 +161,6 @@ onBeforeUnmount(() => {
     window.clearTimeout(pendingFitTimer);
     pendingFitTimer = null;
   }
-  if (pendingRouteTimer !== null) {
-    window.clearTimeout(pendingRouteTimer);
-    pendingRouteTimer = null;
-  }
   driving?.clear?.();
   driverMarkers.forEach((marker) => {
     marker?.stopMove?.();
@@ -173,6 +179,7 @@ watch(
     props.destinationLng,
     props.drivers,
     props.liveDriverLocations,
+    props.actualRoute,
     props.currentOrder,
   ],
   () => {
@@ -205,8 +212,6 @@ function syncMarkers() {
     map.add(routeLine);
   }
 
-  routeLine.setPath([]);
-
   const activeIDs = new Set<string>();
   for (const driver of mergedDrivers.value) {
     activeIDs.add(driver.driver_id);
@@ -229,7 +234,7 @@ function syncMarkers() {
   });
 
   scheduleFitView();
-  scheduleRouteRefresh();
+  syncRouteLine();
 }
 
 function upsertStaticMarker(marker: any, position: [number, number], content: string) {
@@ -346,84 +351,233 @@ function scheduleFitView() {
   }, remaining);
 }
 
-function scheduleRouteRefresh() {
+function syncRouteLine() {
   const plan = currentRoutePlan();
   if (!plan || !driving) {
-    routeSignature = "";
-    lastRouteOrigin = null;
-    lastRouteSearchAt = 0;
-    driving?.clear?.();
-    setFallbackRoute([]);
-    if (pendingRouteTimer !== null) {
-      window.clearTimeout(pendingRouteTimer);
-      pendingRouteTimer = null;
+    clearRouteState();
+    return;
+  }
+
+  const actualPath = currentActualRoutePath(plan);
+  if (actualPath) {
+    const actualSignature = `actual:${props.actualRoute?.order_id ?? ""}:${props.actualRoute?.mode ?? ""}:${props.actualRoute?.updated_at ?? ""}`;
+    if (routeSignature !== actualSignature) {
+      routeSignature = actualSignature;
+      plannedRoutePath = dedupePath(actualPath);
+      consumedRouteIndex = 0;
+      lastRouteRefreshAt = Date.now();
+      activeRouteRequestId += 1;
+    }
+    renderRoutePath(plan, plannedRoutePath);
+    return;
+  }
+
+  if (shouldRefreshRouteForDeviation(plan)) {
+    refreshDrivingRoute(plan);
+    if (plannedRoutePath.length === 0) {
+      renderRoutePath(plan, [plan.origin, plan.destination]);
     }
     return;
   }
 
-  const signature = `${plan.mode}:${plan.destination[0].toFixed(5)},${plan.destination[1].toFixed(5)}`;
-  const movedEnough = !lastRouteOrigin || distanceMeters(lastRouteOrigin, plan.origin) >= routeRefreshMinMovementM;
-
-  if (signature !== routeSignature || movedEnough) {
-    routeSignature = signature;
-    if (pendingRouteTimer !== null) {
-      window.clearTimeout(pendingRouteTimer);
-      pendingRouteTimer = null;
+  if (plan.signature !== routeSignature || plannedRoutePath.length === 0) {
+    refreshDrivingRoute(plan);
+    if (plannedRoutePath.length === 0) {
+      renderRoutePath(plan, [plan.origin, plan.destination]);
     }
-    refreshDrivingRoute(plan.origin, plan.destination);
     return;
   }
 
-  const remaining = routeRefreshCooldownMs - (Date.now() - lastRouteSearchAt);
-  if (remaining <= 0) {
-    refreshDrivingRoute(plan.origin, plan.destination);
-    return;
-  }
-  if (pendingRouteTimer !== null) {
-    return;
-  }
-
-  pendingRouteTimer = window.setTimeout(() => {
-    pendingRouteTimer = null;
-    const nextPlan = currentRoutePlan();
-    if (!nextPlan) {
-      driving?.clear?.();
-      routeSignature = "";
-      lastRouteOrigin = null;
-      setFallbackRoute([]);
-      return;
-    }
-    refreshDrivingRoute(nextPlan.origin, nextPlan.destination);
-  }, remaining);
+  renderRoutePath(plan, plannedRoutePath);
 }
 
-function refreshDrivingRoute(origin: [number, number], destination: [number, number]) {
+function clearRouteState() {
+  routeSignature = "";
+  plannedRoutePath = [];
+  consumedRouteIndex = 0;
+  lastRouteRefreshAt = 0;
+  activeRouteRequestId += 1;
+  driving?.clear?.();
+  setFallbackRoute([]);
+}
+
+function refreshDrivingRoute(plan: RoutePlan) {
   if (!driving) {
     return;
   }
 
-  lastRouteSearchAt = Date.now();
-  lastRouteOrigin = origin;
+  routeSignature = plan.signature;
+  plannedRoutePath = [];
+  consumedRouteIndex = 0;
+  lastRouteRefreshAt = Date.now();
   const requestID = ++activeRouteRequestId;
-  driving.search(origin, destination, (status: string, result: any) => {
+  driving.search(plan.origin, plan.destination, (status: string, result: any) => {
     if (requestID !== activeRouteRequestId) {
       return;
     }
     if (status !== "complete") {
       console.warn("driving route search failed:", status);
-      setFallbackRoute([origin, destination]);
+      plannedRoutePath = dedupePath([plan.origin, plan.destination]);
+      renderRoutePath(plan, plannedRoutePath);
       return;
     }
     const plannedPath = extractDrivingPath(result);
-    if (plannedPath.length === 0) {
-      setFallbackRoute([origin, destination]);
+    plannedRoutePath = dedupePath(plannedPath.length > 0 ? plannedPath : [plan.origin, plan.destination]);
+
+    const latestPlan = currentRoutePlan();
+    if (!latestPlan || latestPlan.signature !== plan.signature) {
       return;
     }
-    setFallbackRoute(plannedPath);
+    renderRoutePath(latestPlan, plannedRoutePath);
   });
 }
 
-function currentRoutePlan(): { origin: [number, number]; destination: [number, number]; mode: string } | null {
+function renderRoutePath(plan: RoutePlan, path: Array<[number, number]>) {
+  const normalized = dedupePath(path);
+  if (normalized.length === 0) {
+    setFallbackRoute([]);
+    return;
+  }
+
+  if (plan.mode === "preview" || !plan.driverPosition) {
+    setFallbackRoute(normalized);
+    return;
+  }
+
+  setFallbackRoute(trimDrivenPath(normalized, plan.driverPosition));
+}
+
+function currentActualRoutePath(plan: RoutePlan) {
+  const route = props.actualRoute;
+  const order = props.currentOrder;
+  if (!route || !order || !order.driver_id || plan.mode === "preview") {
+    return null;
+  }
+  if (route.order_id !== order.id || route.driver_id !== order.driver_id) {
+    return null;
+  }
+  if (route.mode && route.mode !== plan.mode) {
+    return null;
+  }
+
+  const points = route.points
+    .map((point) => [point.lng, point.lat] as [number, number])
+    .filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]));
+  return points.length > 0 ? dedupePath(points) : null;
+}
+
+function shouldRefreshRouteForDeviation(plan: RoutePlan) {
+  if (plan.mode === "preview" || !plan.driverPosition || plannedRoutePath.length < 2) {
+    return false;
+  }
+  if (plan.signature !== routeSignature) {
+    return false;
+  }
+  if (Date.now() - lastRouteRefreshAt < routeDeviationCooldownMs) {
+    return false;
+  }
+  return distanceToPathMeters(plan.driverPosition, plannedRoutePath) > routeDeviationRefreshM;
+}
+
+function trimDrivenPath(path: Array<[number, number]>, driverPosition: [number, number]) {
+  if (path.length === 0) {
+    return [driverPosition];
+  }
+
+  if (path.length === 1) {
+    return dedupePath([driverPosition, path[0]]);
+  }
+
+  const startIndex = Math.max(0, Math.min(consumedRouteIndex, path.length - 2));
+  let nearestSegmentIndex = startIndex;
+  let nearestProjection = path[startIndex];
+  let nearestDistance = Number.POSITIVE_INFINITY;
+
+  for (let index = startIndex; index < path.length - 1; index += 1) {
+    const projection = projectPointToSegment(driverPosition, path[index], path[index + 1]);
+    if (projection.distance < nearestDistance) {
+      nearestDistance = projection.distance;
+      nearestSegmentIndex = index;
+      nearestProjection = projection.point;
+    }
+  }
+
+  consumedRouteIndex = Math.max(consumedRouteIndex, nearestSegmentIndex);
+  const visiblePath: Array<[number, number]> = [driverPosition];
+  if (!samePosition(visiblePath[visiblePath.length - 1], nearestProjection)) {
+    visiblePath.push(nearestProjection);
+  }
+  for (const point of path.slice(consumedRouteIndex + 1)) {
+    if (!samePosition(visiblePath[visiblePath.length - 1], point)) {
+      visiblePath.push(point);
+    }
+  }
+  return visiblePath;
+}
+
+function projectPointToSegment(point: [number, number], start: [number, number], end: [number, number]) {
+  const midLatRad = ((start[1] + end[1] + point[1]) / 3) * Math.PI / 180;
+  const scaleX = 111320 * Math.cos(midLatRad);
+  const scaleY = 111320;
+
+  const sx = start[0] * scaleX;
+  const sy = start[1] * scaleY;
+  const ex = end[0] * scaleX;
+  const ey = end[1] * scaleY;
+  const px = point[0] * scaleX;
+  const py = point[1] * scaleY;
+
+  const dx = ex - sx;
+  const dy = ey - sy;
+  const lengthSquared = dx * dx + dy * dy;
+  if (lengthSquared === 0) {
+    return {
+      point: start,
+      distance: distanceMeters(point, start),
+    };
+  }
+
+  const ratio = Math.max(0, Math.min(1, ((px-sx)*dx + (py-sy)*dy) / lengthSquared));
+  const projected: [number, number] = [
+    start[0] + (end[0] - start[0]) * ratio,
+    start[1] + (end[1] - start[1]) * ratio,
+  ];
+  return {
+    point: projected,
+    distance: distanceMeters(point, projected),
+  };
+}
+
+function distanceToPathMeters(point: [number, number], path: Array<[number, number]>) {
+  if (path.length === 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+  if (path.length === 1) {
+    return distanceMeters(point, path[0]);
+  }
+
+  let best = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < path.length - 1; index += 1) {
+    const projection = projectPointToSegment(point, path[index], path[index + 1]);
+    if (projection.distance < best) {
+      best = projection.distance;
+    }
+  }
+  return best;
+}
+
+function dedupePath(path: Array<[number, number]>) {
+  const normalized: Array<[number, number]> = [];
+  for (const point of path) {
+    const prev = normalized[normalized.length - 1];
+    if (!prev || !samePosition(prev, point)) {
+      normalized.push(point);
+    }
+  }
+  return normalized;
+}
+
+function currentRoutePlan(): RoutePlan | null {
   const activePlan = activeDriverRoutePlan();
   if (activePlan) {
     return activePlan;
@@ -437,10 +591,11 @@ function currentRoutePlan(): { origin: [number, number]; destination: [number, n
     origin: [props.pickupLng, props.pickupLat],
     destination: [props.destinationLng, props.destinationLat],
     mode: "preview",
+    signature: `preview:${props.pickupLng.toFixed(5)},${props.pickupLat.toFixed(5)}:${props.destinationLng.toFixed(5)},${props.destinationLat.toFixed(5)}`,
   };
 }
 
-function activeDriverRoutePlan(): { origin: [number, number]; destination: [number, number]; mode: string } | null {
+function activeDriverRoutePlan(): RoutePlan | null {
   const order = props.currentOrder;
   if (!order || !order.driver_id) {
     return null;
@@ -458,12 +613,16 @@ function activeDriverRoutePlan(): { origin: [number, number]; destination: [numb
         origin: [driver.lng, driver.lat],
         destination: [props.pickupLng, props.pickupLat],
         mode: "pickup",
+        signature: `pickup:${order.id}:${order.driver_id}:${props.pickupLng.toFixed(5)},${props.pickupLat.toFixed(5)}`,
+        driverPosition: [driver.lng, driver.lat],
       };
     case "in_trip":
       return {
         origin: [driver.lng, driver.lat],
         destination: [props.destinationLng, props.destinationLat],
         mode: "trip",
+        signature: `trip:${order.id}:${order.driver_id}:${props.destinationLng.toFixed(5)},${props.destinationLat.toFixed(5)}`,
+        driverPosition: [driver.lng, driver.lat],
       };
     default:
       return null;
@@ -508,10 +667,34 @@ function badgeHTML(text: string, color: string) {
 }
 
 function driverMarkerHTML(text: string) {
-  return `<div style="position:relative;width:44px;height:44px;display:grid;place-items:center;">
-    <div style="position:absolute;inset:8px;border-radius:18px;background:linear-gradient(135deg,#f26b3a,#ff9b56);box-shadow:0 12px 28px rgba(242,107,58,.28);border:2px solid rgba(255,255,255,.96);"></div>
-    <div style="position:absolute;top:1px;left:50%;transform:translateX(-50%);width:0;height:0;border-left:8px solid transparent;border-right:8px solid transparent;border-bottom:12px solid #f26b3a;"></div>
-    <div style="position:relative;color:#fff;font-size:12px;font-weight:800;letter-spacing:.03em;">${text}</div>
+  const carSVG = encodeURIComponent(`
+    <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+      <defs>
+        <linearGradient id="carBody" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stop-color="#ff9f5a"/>
+          <stop offset="100%" stop-color="#e45528"/>
+        </linearGradient>
+      </defs>
+      <g>
+        <ellipse cx="32" cy="56" rx="15" ry="4" fill="rgba(58,30,14,0.18)"/>
+        <rect x="18" y="10" width="28" height="44" rx="12" fill="url(#carBody)" stroke="#fff8ef" stroke-width="3"/>
+        <path d="M24 19c0-3.3 2.7-6 6-6h4c3.3 0 6 2.7 6 6v9H24z" fill="#ffe6cf"/>
+        <rect x="24" y="33" width="16" height="13" rx="5" fill="#fff4ea" opacity="0.96"/>
+        <rect x="21" y="15" width="4" height="10" rx="2" fill="#ffd1b1" opacity="0.9"/>
+        <rect x="39" y="15" width="4" height="10" rx="2" fill="#ffd1b1" opacity="0.9"/>
+        <rect x="21" y="39" width="4" height="10" rx="2" fill="#bf3f1b" opacity="0.92"/>
+        <rect x="39" y="39" width="4" height="10" rx="2" fill="#bf3f1b" opacity="0.92"/>
+        <circle cx="23" cy="22" r="3.5" fill="#10151c"/>
+        <circle cx="41" cy="22" r="3.5" fill="#10151c"/>
+        <circle cx="23" cy="43" r="3.5" fill="#10151c"/>
+        <circle cx="41" cy="43" r="3.5" fill="#10151c"/>
+      </g>
+    </svg>
+  `);
+
+  return `<div style="position:relative;width:52px;height:52px;display:grid;place-items:center;filter:drop-shadow(0 12px 18px rgba(83,45,17,.22));">
+    <img src="data:image/svg+xml;charset=UTF-8,${carSVG}" alt="car" style="width:52px;height:52px;display:block;user-select:none;pointer-events:none;" />
+    <div style="position:absolute;right:-4px;bottom:-1px;min-width:20px;height:20px;padding:0 6px;border-radius:999px;background:rgba(31,41,51,.88);color:#fff;font-size:10px;font-weight:800;line-height:20px;text-align:center;border:2px solid rgba(255,249,241,.96);">${text}</div>
   </div>`;
 }
 </script>

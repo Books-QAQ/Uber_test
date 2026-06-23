@@ -13,6 +13,7 @@ import (
 	"uber-test/backend/internal/location"
 	"uber-test/backend/internal/model"
 	"uber-test/backend/internal/order"
+	"uber-test/backend/internal/routeplan"
 	"uber-test/backend/internal/trip"
 )
 
@@ -24,6 +25,7 @@ type RouterDeps struct {
 	OrderService    *order.Service
 	TripService     *trip.Service
 	DispatchService *dispatch.Service
+	RouteService    *routeplan.Service
 	Hub             *wsapi.Hub
 	WSReadBuffer    int
 	WSWriteBuffer   int
@@ -36,8 +38,9 @@ func NewRouter(deps RouterDeps) http.Handler {
 	authHandler := handlers.NewAuthHandler(deps.AuthService)
 	locationHandler := handlers.NewLocationHandler(deps.LocationService)
 	driverHandler := handlers.NewDriverHandler(deps.LocationService)
+	routeHandler := handlers.NewRouteHandler(deps.RouteService)
 	tripHandler := handlers.NewTripHandler(deps.TripService)
-	orderHandler := handlers.NewOrderHandler(deps.OrderService, tripHandler)
+	orderHandler := handlers.NewOrderHandler(deps.OrderService, tripHandler, routeHandler)
 	dispatchHandler := handlers.NewDispatchHandler(deps.DispatchService)
 	requireAuth := deps.Authenticator.RequireAuth
 
@@ -51,7 +54,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 	mux.HandleFunc("/api/v1/auth/register", authHandler.Register)
 	mux.HandleFunc("/api/v1/auth/login", authHandler.Login)
 	mux.Handle("/api/v1/auth/me", requireAuth(http.HandlerFunc(authHandler.Me)))
-	mux.Handle("/api/v1/drivers/", requireAuth(middleware.RequireRoles(model.RoleDriver, model.RoleAdmin)(http.HandlerFunc(routeDriverSubresources(driverHandler, orderHandler, dispatchHandler)))))
+	mux.Handle("/api/v1/drivers/", requireAuth(middleware.RequireRoles(model.RoleDriver, model.RoleAdmin)(http.HandlerFunc(routeDriverSubresources(driverHandler, orderHandler, dispatchHandler, routeHandler)))))
 	mux.Handle("/api/v1/drivers/nearby", requireAuth(middleware.RequireRoles(model.RolePassenger, model.RoleDriver, model.RoleAdmin)(http.HandlerFunc(driverHandler.ListNearby))))
 	mux.Handle("/api/v1/drivers/locations", requireAuth(middleware.RequireRoles(model.RoleAdmin)(http.HandlerFunc(locationHandler.ListLatest))))
 	mux.Handle("/api/v1/orders", requireAuth(middleware.RequireRoles(model.RolePassenger, model.RoleDriver, model.RoleAdmin)(http.HandlerFunc(routeOrderCollection(orderHandler)))))
@@ -77,7 +80,7 @@ func routeOrderCollection(handler *handlers.OrderHandler) http.HandlerFunc {
 	}
 }
 
-func routeDriverSubresources(driverHandler *handlers.DriverHandler, orderHandler *handlers.OrderHandler, dispatchHandler *handlers.DispatchHandler) http.HandlerFunc {
+func routeDriverSubresources(driverHandler *handlers.DriverHandler, orderHandler *handlers.OrderHandler, dispatchHandler *handlers.DispatchHandler, routeHandler *handlers.RouteHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/status"):
@@ -86,6 +89,8 @@ func routeDriverSubresources(driverHandler *handlers.DriverHandler, orderHandler
 			orderHandler.GetCurrentByDriver(w, r)
 		case strings.HasSuffix(r.URL.Path, "/dispatches"):
 			dispatchHandler.ListPendingByDriver(w, r)
+		case strings.HasSuffix(r.URL.Path, "/route"):
+			routeHandler.UpsertByDriver(w, r)
 		default:
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)

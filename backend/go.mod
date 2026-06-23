@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/alicebob/miniredis/v2 v2.38.0
+	github.com/dhconnelly/rtreego v1.2.0
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/gorilla/websocket v1.5.3

@@ -69,3 +69,16 @@ export type DriverLiveLocation = {
   timestamp?: string;
   order_id?: string;
 };
+
+export type RoutePoint = {
+  lat: number;
+  lng: number;
+};
+
+export type DriverRoute = {
+  driver_id: string;
+  order_id: string;
+  mode: string;
+  points: RoutePoint[];
+  updated_at: string;
+};
