@@ -6,15 +6,22 @@ import (
 	"strings"
 
 	"uber-test/backend/internal/api/http/handlers"
+	"uber-test/backend/internal/api/http/middleware"
 	wsapi "uber-test/backend/internal/api/ws"
+	"uber-test/backend/internal/auth"
 	"uber-test/backend/internal/location"
+	"uber-test/backend/internal/model"
 	"uber-test/backend/internal/order"
+	"uber-test/backend/internal/trip"
 )
 
 type RouterDeps struct {
 	Logger          *slog.Logger
+	AuthService     *auth.Service
+	Authenticator   *middleware.Authenticator
 	LocationService *location.Service
 	OrderService    *order.Service
+	TripService     *trip.Service
 	Hub             *wsapi.Hub
 	WSReadBuffer    int
 	WSWriteBuffer   int
@@ -24,9 +31,12 @@ func NewRouter(deps RouterDeps) http.Handler {
 	mux := http.NewServeMux()
 
 	healthHandler := handlers.NewHealthHandler()
+	authHandler := handlers.NewAuthHandler(deps.AuthService)
 	locationHandler := handlers.NewLocationHandler(deps.LocationService)
 	driverHandler := handlers.NewDriverHandler(deps.LocationService)
-	orderHandler := handlers.NewOrderHandler(deps.OrderService)
+	tripHandler := handlers.NewTripHandler(deps.TripService)
+	orderHandler := handlers.NewOrderHandler(deps.OrderService, tripHandler)
+	requireAuth := deps.Authenticator.RequireAuth
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -35,12 +45,16 @@ func NewRouter(deps RouterDeps) http.Handler {
 	})
 	mux.HandleFunc("/healthz", healthHandler.Get)
 	mux.HandleFunc("/api/v1/healthz", healthHandler.Get)
-	mux.HandleFunc("/api/v1/drivers/", routeDriverSubresources(driverHandler, orderHandler))
-	mux.HandleFunc("/api/v1/drivers/nearby", driverHandler.ListNearby)
-	mux.HandleFunc("/api/v1/drivers/locations", locationHandler.ListLatest)
-	mux.HandleFunc("/api/v1/orders", routeOrderCollection(orderHandler))
-	mux.HandleFunc("/api/v1/orders/", orderHandler.GetOrUpdateStatus)
-	mux.Handle("/ws/location", wsapi.NewHandler(deps.Hub, deps.WSReadBuffer, deps.WSWriteBuffer))
+	mux.HandleFunc("/api/v1/auth/register", authHandler.Register)
+	mux.HandleFunc("/api/v1/auth/login", authHandler.Login)
+	mux.Handle("/api/v1/auth/me", requireAuth(http.HandlerFunc(authHandler.Me)))
+	mux.Handle("/api/v1/drivers/", requireAuth(middleware.RequireRoles(model.RoleDriver, model.RoleAdmin)(http.HandlerFunc(routeDriverSubresources(driverHandler, orderHandler)))))
+	mux.Handle("/api/v1/drivers/nearby", requireAuth(middleware.RequireRoles(model.RolePassenger, model.RoleDriver, model.RoleAdmin)(http.HandlerFunc(driverHandler.ListNearby))))
+	mux.Handle("/api/v1/drivers/locations", requireAuth(middleware.RequireRoles(model.RoleAdmin)(http.HandlerFunc(locationHandler.ListLatest))))
+	mux.Handle("/api/v1/orders", requireAuth(middleware.RequireRoles(model.RolePassenger, model.RoleDriver, model.RoleAdmin)(http.HandlerFunc(routeOrderCollection(orderHandler)))))
+	mux.Handle("/api/v1/orders/", requireAuth(middleware.RequireRoles(model.RolePassenger, model.RoleDriver, model.RoleAdmin)(http.HandlerFunc(orderHandler.GetOrUpdateStatus))))
+	mux.Handle("/api/v1/trips", requireAuth(middleware.RequireRoles(model.RoleAdmin)(http.HandlerFunc(tripHandler.List))))
+	mux.Handle("/ws/location", requireAuth(wsapi.NewHandler(deps.Hub, deps.WSReadBuffer, deps.WSWriteBuffer)))
 
 	return withLogging(deps.Logger, mux)
 }

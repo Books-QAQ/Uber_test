@@ -13,16 +13,22 @@ import (
 type Service struct {
 	store              Store
 	driverStatusWriter DriverStatusWriter
+	tripLifecycle      TripLifecycleWriter
 }
 
 type DriverStatusWriter interface {
 	SetDriverStatus(ctx context.Context, status model.DriverStatus) error
 }
 
-func NewService(store Store, driverStatusWriter DriverStatusWriter) *Service {
+type TripLifecycleWriter interface {
+	SyncWithOrder(ctx context.Context, order model.Order, input model.UpdateOrderStatusInput) (model.Trip, error)
+}
+
+func NewService(store Store, driverStatusWriter DriverStatusWriter, tripLifecycle TripLifecycleWriter) *Service {
 	return &Service{
 		store:              store,
 		driverStatusWriter: driverStatusWriter,
+		tripLifecycle:      tripLifecycle,
 	}
 }
 
@@ -62,6 +68,20 @@ func (s *Service) List(ctx context.Context) ([]model.Order, error) {
 	return s.store.List(ctx)
 }
 
+func (s *Service) ListByPassengerID(ctx context.Context, passengerID string) ([]model.Order, error) {
+	if passengerID == "" {
+		return nil, fmt.Errorf("list orders: missing passenger_id")
+	}
+	return s.store.ListByPassengerID(ctx, passengerID)
+}
+
+func (s *Service) ListByDriverID(ctx context.Context, driverID string) ([]model.Order, error) {
+	if driverID == "" {
+		return nil, fmt.Errorf("list orders: missing driver_id")
+	}
+	return s.store.ListByDriverID(ctx, driverID)
+}
+
 func (s *Service) GetCurrentByDriverID(ctx context.Context, driverID string) (model.Order, error) {
 	if driverID == "" {
 		return model.Order{}, fmt.Errorf("get current order: missing driver_id")
@@ -94,6 +114,10 @@ func (s *Service) UpdateStatus(ctx context.Context, id string, input model.Updat
 		order.FinalPrice = order.EstimatedPrice
 	}
 	order.UpdatedAt = time.Now().UTC()
+
+	if err := s.syncTrip(ctx, &order, input); err != nil {
+		return model.Order{}, err
+	}
 
 	if err := s.store.Update(ctx, order); err != nil {
 		return model.Order{}, err
@@ -177,6 +201,28 @@ func (s *Service) syncDriverStatus(ctx context.Context, order model.Order, order
 		Status:    driverStatus,
 		UpdatedAt: time.Now().UTC(),
 	})
+}
+
+func (s *Service) syncTrip(ctx context.Context, order *model.Order, input model.UpdateOrderStatusInput) error {
+	if s.tripLifecycle == nil {
+		return nil
+	}
+
+	switch order.Status {
+	case model.OrderStatusAccepted, model.OrderStatusDriverArrived, model.OrderStatusInTrip, model.OrderStatusCompleted, model.OrderStatusToBePaid, model.OrderStatusPaid:
+	default:
+		return nil
+	}
+
+	trip, err := s.tripLifecycle.SyncWithOrder(ctx, *order, input)
+	if err != nil {
+		return err
+	}
+	if trip.FinalPrice > 0 {
+		order.FinalPrice = trip.FinalPrice
+	}
+
+	return nil
 }
 
 func isValidOrderTransition(from, to string) bool {

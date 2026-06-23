@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"uber-test/backend/internal/api/http/middleware"
 	"uber-test/backend/internal/location"
 	"uber-test/backend/internal/model"
 )
@@ -35,6 +36,12 @@ func (h *DriverHandler) SetStatus(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"error": "invalid driver status path",
+		})
+		return
+	}
+	if err := middleware.MustBeSelfOrAdmin(r, driverID); err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]any{
+			"error": err.Error(),
 		})
 		return
 	}

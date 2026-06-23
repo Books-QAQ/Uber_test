@@ -7,36 +7,50 @@ import (
 )
 
 type Config struct {
-	AppEnv              string
-	HTTPAddr            string
-	UDPAddr             string
-	WSReadBuffer        int
-	WSWriteBuffer       int
-	RecentLocationLimit int
-	RedisEnabled        bool
-	RedisAddr           string
-	RedisPassword       string
-	RedisDB             int
-	RedisKeyPrefix      string
-	RedisLocationTTL    time.Duration
-	ShutdownTimeout     time.Duration
+	AppEnv               string
+	HTTPAddr             string
+	UDPAddr              string
+	AuthJWTSecret        string
+	AuthTokenTTL         time.Duration
+	MySQLEnabled         bool
+	MySQLDSN             string
+	MySQLMaxOpenConns    int
+	MySQLMaxIdleConns    int
+	MySQLConnMaxLifetime time.Duration
+	WSReadBuffer         int
+	WSWriteBuffer        int
+	RecentLocationLimit  int
+	RedisEnabled         bool
+	RedisAddr            string
+	RedisPassword        string
+	RedisDB              int
+	RedisKeyPrefix       string
+	RedisLocationTTL     time.Duration
+	ShutdownTimeout      time.Duration
 }
 
 func Load() Config {
 	return Config{
-		AppEnv:              getEnv("APP_ENV", "local"),
-		HTTPAddr:            getEnv("HTTP_ADDR", ":8080"),
-		UDPAddr:             getEnv("UDP_ADDR", ":9000"),
-		WSReadBuffer:        getEnvInt("WS_READ_BUFFER", 1024),
-		WSWriteBuffer:       getEnvInt("WS_WRITE_BUFFER", 1024),
-		RecentLocationLimit: getEnvInt("RECENT_LOCATION_LIMIT", 20),
-		RedisEnabled:        getEnvBool("REDIS_ENABLED", false),
-		RedisAddr:           getEnv("REDIS_ADDR", "127.0.0.1:6379"),
-		RedisPassword:       getEnv("REDIS_PASSWORD", ""),
-		RedisDB:             getEnvInt("REDIS_DB", 0),
-		RedisKeyPrefix:      getEnv("REDIS_KEY_PREFIX", "uber-test"),
-		RedisLocationTTL:    getEnvDuration("REDIS_LOCATION_TTL", 24*time.Hour),
-		ShutdownTimeout:     getEnvDuration("SHUTDOWN_TIMEOUT", 10*time.Second),
+		AppEnv:               getEnv("APP_ENV", "local"),
+		HTTPAddr:             getEnv("HTTP_ADDR", ":8080"),
+		UDPAddr:              getEnv("UDP_ADDR", ":9000"),
+		AuthJWTSecret:        getEnv("AUTH_JWT_SECRET", "dev-secret-change-me"),
+		AuthTokenTTL:         getEnvDuration("AUTH_TOKEN_TTL", 24*time.Hour),
+		MySQLEnabled:         getEnvBool("MYSQL_ENABLED", false),
+		MySQLDSN:             getEnv("MYSQL_DSN", "root:root@tcp(127.0.0.1:3306)/uber_test?parseTime=true"),
+		MySQLMaxOpenConns:    getEnvInt("MYSQL_MAX_OPEN_CONNS", 10),
+		MySQLMaxIdleConns:    getEnvInt("MYSQL_MAX_IDLE_CONNS", 5),
+		MySQLConnMaxLifetime: getEnvDuration("MYSQL_CONN_MAX_LIFETIME", time.Hour),
+		WSReadBuffer:         getEnvInt("WS_READ_BUFFER", 1024),
+		WSWriteBuffer:        getEnvInt("WS_WRITE_BUFFER", 1024),
+		RecentLocationLimit:  getEnvInt("RECENT_LOCATION_LIMIT", 20),
+		RedisEnabled:         getEnvBool("REDIS_ENABLED", false),
+		RedisAddr:            getEnv("REDIS_ADDR", "127.0.0.1:6379"),
+		RedisPassword:        getEnv("REDIS_PASSWORD", ""),
+		RedisDB:              getEnvInt("REDIS_DB", 0),
+		RedisKeyPrefix:       getEnv("REDIS_KEY_PREFIX", "uber-test"),
+		RedisLocationTTL:     getEnvDuration("REDIS_LOCATION_TTL", 24*time.Hour),
+		ShutdownTimeout:      getEnvDuration("SHUTDOWN_TIMEOUT", 10*time.Second),
 	}
 }
 

@@ -13,6 +13,8 @@ type Store interface {
 	Create(ctx context.Context, order model.Order) error
 	GetByID(ctx context.Context, id string) (model.Order, error)
 	List(ctx context.Context) ([]model.Order, error)
+	ListByPassengerID(ctx context.Context, passengerID string) ([]model.Order, error)
+	ListByDriverID(ctx context.Context, driverID string) ([]model.Order, error)
 	FindActiveByDriverID(ctx context.Context, driverID string) (model.Order, error)
 	Update(ctx context.Context, order model.Order) error
 }
@@ -59,16 +61,37 @@ func (s *MemoryStore) List(_ context.Context) ([]model.Order, error) {
 		items = append(items, order)
 	}
 
-	slices.SortFunc(items, func(a, b model.Order) int {
-		if a.CreatedAt.After(b.CreatedAt) {
-			return -1
-		}
-		if a.CreatedAt.Before(b.CreatedAt) {
-			return 1
-		}
-		return 0
-	})
+	sortOrdersByCreatedAt(items)
+	return items, nil
+}
 
+func (s *MemoryStore) ListByPassengerID(_ context.Context, passengerID string) ([]model.Order, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	items := make([]model.Order, 0)
+	for _, order := range s.orders {
+		if order.PassengerID == passengerID {
+			items = append(items, order)
+		}
+	}
+
+	sortOrdersByCreatedAt(items)
+	return items, nil
+}
+
+func (s *MemoryStore) ListByDriverID(_ context.Context, driverID string) ([]model.Order, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	items := make([]model.Order, 0)
+	for _, order := range s.orders {
+		if order.DriverID == driverID {
+			items = append(items, order)
+		}
+	}
+
+	sortOrdersByCreatedAt(items)
 	return items, nil
 }
 
@@ -97,4 +120,16 @@ func (s *MemoryStore) Update(_ context.Context, order model.Order) error {
 	}
 	s.orders[order.ID] = order
 	return nil
+}
+
+func sortOrdersByCreatedAt(items []model.Order) {
+	slices.SortFunc(items, func(a, b model.Order) int {
+		if a.CreatedAt.After(b.CreatedAt) {
+			return -1
+		}
+		if a.CreatedAt.Before(b.CreatedAt) {
+			return 1
+		}
+		return 0
+	})
 }

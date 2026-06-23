@@ -28,7 +28,7 @@ func TestServiceCreateAndUpdateStatus(t *testing.T) {
 	t.Parallel()
 
 	driverWriter := &stubDriverStatusWriter{}
-	service := NewService(NewMemoryStore(), driverWriter)
+	service := NewService(NewMemoryStore(), driverWriter, nil)
 
 	order, err := service.Create(context.Background(), model.CreateOrderInput{
 		PassengerID:        "passenger-1",
@@ -71,7 +71,7 @@ func TestServiceUpdateStatusLifecycleSyncsDriverStatus(t *testing.T) {
 	t.Parallel()
 
 	driverWriter := &stubDriverStatusWriter{}
-	service := NewService(NewMemoryStore(), driverWriter)
+	service := NewService(NewMemoryStore(), driverWriter, nil)
 
 	order, err := service.Create(context.Background(), model.CreateOrderInput{
 		PassengerID:    "passenger-2",
@@ -132,7 +132,7 @@ func TestServiceAcceptedOrderRemovesDriverFromNearbyAvailability(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	locationService := location.NewService(location.NewMemoryStore(10), nilBroadcaster{}, logger)
-	service := NewService(NewMemoryStore(), locationService)
+	service := NewService(NewMemoryStore(), locationService, nil)
 
 	if err := locationService.SetDriverStatus(context.Background(), model.DriverStatus{
 		DriverID:  "driver-3",
@@ -184,7 +184,7 @@ func (nilBroadcaster) BroadcastJSON(any) {}
 func TestServiceRejectsSecondActiveOrderForSameDriver(t *testing.T) {
 	t.Parallel()
 
-	service := NewService(NewMemoryStore(), nil)
+	service := NewService(NewMemoryStore(), nil, nil)
 
 	first, err := service.Create(context.Background(), model.CreateOrderInput{
 		PassengerID:    "passenger-a",
@@ -225,7 +225,7 @@ func TestServiceRejectsSecondActiveOrderForSameDriver(t *testing.T) {
 func TestServiceGetCurrentByDriverID(t *testing.T) {
 	t.Parallel()
 
-	service := NewService(NewMemoryStore(), nil)
+	service := NewService(NewMemoryStore(), nil, nil)
 
 	order, err := service.Create(context.Background(), model.CreateOrderInput{
 		PassengerID:    "passenger-current",

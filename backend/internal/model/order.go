@@ -43,6 +43,10 @@ type CreateOrderInput struct {
 }
 
 type UpdateOrderStatusInput struct {
-	Status   string `json:"status"`
-	DriverID string `json:"driver_id,omitempty"`
+	Status           string  `json:"status"`
+	DriverID         string  `json:"driver_id,omitempty"`
+	ActualDistanceM  int     `json:"actual_distance_m,omitempty"`
+	ActualDurationS  int     `json:"actual_duration_s,omitempty"`
+	WaitingDurationS int     `json:"waiting_duration_s,omitempty"`
+	FinalPrice       float64 `json:"final_price,omitempty"`
 }
