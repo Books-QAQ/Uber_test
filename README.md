@@ -1,75 +1,72 @@
-# Uber_test
+# Uber_test 中文运行教程
 
-A Go-based, front-end/back-end separated taxi dispatch system inspired by Uber's realtime map experience.
+这是一个使用 `Go + Vue` 搭建的打车调度测试项目，当前已经具备下面这些核心链路：
 
-## Current Scope
+- 乘客端前端页面
+- Go 后端 API 服务
+- UDP + Protobuf 司机位置上报
+- WebSocket 实时位置推送
+- 自动派单
+- 司机模拟器
+- 可选 Redis / MySQL 持久化
 
-- Go backend scaffold
-- HTTP health and location query endpoints
-- UDP location ingress
-- WebSocket realtime push hub
-- Project design documentation
 
-## Structure
+## 1. 运行前准备
 
-```text
-docs/
-backend/
-frontend-passenger/
-```
+建议本机先安装：
 
-## Quick Start
+- Go 1.22 或更高版本
+- Node.js 18 或更高版本
+- npm
+- 可选：Redis 7+
+- 可选：MySQL 8+
+
+高德地图相关：
+
+- 乘客端前端使用高德 JSAPI
+- 司机模拟器如果想按真实道路规划行驶，建议准备高德 Web 服务 Key
+
+## 2. 启动后端
+
+在项目根目录打开终端：
 
 ```powershell
 cd backend
 go run ./cmd/server
 ```
 
-## Protobuf
+启动成功后，后端默认提供：
 
-The UDP location uplink uses protobuf.
+- HTTP API: `http://127.0.0.1:8080`
+- 健康检查: `http://127.0.0.1:8080/healthz`
+- UDP 位置上报端口: `127.0.0.1:9000`
+- WebSocket: `ws://127.0.0.1:8080/ws/location`
 
-Protocol file:
-
-- `backend/proto/location/v1/location.proto`
-
-Regenerate Go code:
+建议先访问一次健康检查确认服务已起来：
 
 ```powershell
-cd backend
-.\scripts\generate-proto.ps1
+curl http://127.0.0.1:8080/healthz
 ```
 
-Supported ingress packet types:
+## 3. 启动乘客端前端
 
-- `location_update`
-- `heartbeat`
-- `location_batch`
+前端目录：
 
-Each UDP payload should be encoded as `LocationIngressPacket`.
+- `frontend-passenger/`
 
-## Redis
+先配置高德地图环境变量。新建文件：
 
-Location storage supports a two-layer mode:
+- `frontend-passenger/.env.local`
 
-- in-memory hot cache
-- optional Redis shared hot data store
+内容示例：
 
-Enable Redis with env vars in `backend/configs/config.example.env`.
-
-## Passenger Frontend
-
-Passenger-side test frontend lives in `frontend-passenger/`.
-
-Before running it with Gaode Map, create `frontend-passenger/.env.local`:
-
-```powershell
-VITE_AMAP_KEY=your_web_jsapi_key
-VITE_AMAP_SECURITY_JS_CODE=your_security_js_code
+```env
+VITE_AMAP_KEY=你的高德Web端JSAPIKey
+VITE_AMAP_SECURITY_JS_CODE=你的安全密钥
 VITE_AMAP_MAP_STYLE=amap://styles/normal
 ```
 
-Run it with:
+然后安装依赖并启动：
 
 ```powershell
 cd frontend-passenger
@@ -77,21 +74,63 @@ npm install
 npm run dev
 ```
 
-Vite proxies `/api` and `/ws` to `http://127.0.0.1:8080`.
+默认访问地址：
 
-## Driver Simulator
+- `http://127.0.0.1:5173`
 
-Use the driver simulator instead of a driver frontend:
+
+## 4. 启动司机模拟器
+
+这个项目当前没有单独的司机前端，司机侧主要通过模拟器来跑链路。
+
+启动方式：
 
 ```powershell
 cd backend
 go run ./cmd/driver-sim -drivers 2
 ```
 
-It will:
+默认行为：
 
-- auto-register/login test driver accounts
-- set drivers online
-- upload UDP locations periodically
-- poll dispatches and auto-accept orders
-- optionally auto-progress accepted orders
+- 自动注册司机账号
+- 自动登录司机账号
+- 自动将司机设置为在线
+- 周期性上报 UDP 位置
+- 轮询派单列表
+- 自动接单
+- 自动推进订单状态直到完成
+
+常用参数示例：
+
+```powershell
+cd backend
+go run ./cmd/driver-sim `
+  -drivers 3 `
+  -lat 31.2304 `
+  -lng 121.4737 `
+  -radius-m 700 `
+  -amap-web-key 你的高德Web服务Key
+```
+
+说明：
+
+- `-drivers`：模拟司机数量
+- `-lat` / `-lng`：司机活动中心点
+- `-radius-m`：空闲绕行半径
+- `-amap-web-key`：用于按道路路径模拟行驶
+
+如果不传 `-amap-web-key`，模拟器会尝试读取前端 `.env.local` 或环境变量中的高德 Key；仍然拿不到时，会退回 OSRM。
+
+## 5. 推荐的完整启动顺序
+
+建议按这个顺序跑：
+
+1. 启动后端
+2. 启动前端
+3. 启动司机模拟器
+4. 打开乘客端页面注册/登录
+5. 在地图上设置上车点和目的地
+6. 创建订单
+7. 观察自动派单、司机移动、WebSocket 实时更新
+
+
