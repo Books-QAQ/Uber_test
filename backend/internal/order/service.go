@@ -75,18 +75,37 @@ func (s *Service) Create(ctx context.Context, input model.CreateOrderInput) (mod
 }
 
 func (s *Service) GetByID(ctx context.Context, id string) (model.Order, error) {
-	return s.store.GetByID(ctx, id)
+	item, err := s.store.GetByID(ctx, id)
+	if err != nil {
+		return model.Order{}, err
+	}
+	s.maybeDispatchPending(ctx, item)
+	return item, nil
 }
 
 func (s *Service) List(ctx context.Context) ([]model.Order, error) {
-	return s.store.List(ctx)
+	items, err := s.store.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range items {
+		s.maybeDispatchPending(ctx, item)
+	}
+	return items, nil
 }
 
 func (s *Service) ListByPassengerID(ctx context.Context, passengerID string) ([]model.Order, error) {
 	if passengerID == "" {
 		return nil, fmt.Errorf("list orders: missing passenger_id")
 	}
-	return s.store.ListByPassengerID(ctx, passengerID)
+	items, err := s.store.ListByPassengerID(ctx, passengerID)
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range items {
+		s.maybeDispatchPending(ctx, item)
+	}
+	return items, nil
 }
 
 func (s *Service) ListByDriverID(ctx context.Context, driverID string) ([]model.Order, error) {
@@ -324,4 +343,11 @@ func newOrderID() string {
 		return fmt.Sprintf("order-%d", time.Now().UnixNano())
 	}
 	return "order-" + hex.EncodeToString(buf[:])
+}
+
+func (s *Service) maybeDispatchPending(ctx context.Context, item model.Order) {
+	if s.dispatcher == nil || item.Status != model.OrderStatusPendingDispatch {
+		return
+	}
+	_ = s.dispatcher.DispatchOrder(ctx, item)
 }

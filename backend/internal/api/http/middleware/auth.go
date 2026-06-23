@@ -19,9 +19,9 @@ func NewAuthenticator(tokens *auth.TokenManager) *Authenticator {
 
 func (a *Authenticator) RequireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		tokenString := extractBearerToken(r.Header.Get("Authorization"))
+		tokenString := extractAuthToken(r)
 		if tokenString == "" {
-			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "missing authorization header"})
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "missing authorization token"})
 			return
 		}
 
@@ -83,6 +83,13 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func extractAuthToken(r *http.Request) string {
+	if token := extractBearerToken(r.Header.Get("Authorization")); token != "" {
+		return token
+	}
+	return strings.TrimSpace(r.URL.Query().Get("token"))
 }
 
 func extractBearerToken(header string) string {

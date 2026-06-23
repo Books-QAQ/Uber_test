@@ -4,3 +4,5 @@
 .env.*
 backend/.tmp/
 backend/.tools/
+node_modules/
+dist/
