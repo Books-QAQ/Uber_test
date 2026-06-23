@@ -1,4 +1,4 @@
-# Uber_test 中文运行教程
+# Uber_test Guideline
 
 这是一个使用 `Go + Vue` 搭建的打车调度测试项目，当前已经具备下面这些核心链路：
 
