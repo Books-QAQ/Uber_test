@@ -5,6 +5,9 @@ import LiveMap from "./components/LiveMap.vue";
 import type { DriverLiveLocation, DriverRoute, LoginResult, NearbyDriver, Order, SocketEvent, Trip, User } from "./types";
 
 const storageKey = "passenger-lab-session";
+const estimatedFareBase = 10;
+const estimatedFarePerKM = 2;
+const estimatedFareMinimum = 3;
 
 const authMode = ref<"login" | "register">("login");
 const savingAuth = ref(false);
@@ -39,6 +42,9 @@ const session = reactive<{
   user: null,
 });
 
+const accountDisplayName = computed(() => session.user?.display_name || session.user?.phone || "访客");
+const accountSubtitle = computed(() => session.user?.phone || "未登录");
+
 const authForm = reactive({
   phone: "13800138000",
   password: "pass123456",
@@ -59,7 +65,6 @@ const orderForm = reactive({
   destination_lat: 31.2204,
   destination_lng: 121.4637,
   destination_address: "静安寺",
-  estimated_price: 38,
 });
 
 const selectedOrder = computed(() => {
@@ -95,6 +100,13 @@ const mapDestinationLat = computed(() => selectedOrder.value?.destination_lat ??
 const mapDestinationLng = computed(() => selectedOrder.value?.destination_lng ?? orderForm.destination_lng);
 const totalRouteDistanceM = computed(() =>
   distanceMeters(mapPickupLat.value, mapPickupLng.value, mapDestinationLat.value, mapDestinationLng.value),
+);
+const draftRouteDistanceM = computed(() =>
+  distanceMeters(orderForm.pickup_lat, orderForm.pickup_lng, orderForm.destination_lat, orderForm.destination_lng),
+);
+const estimatedOrderPrice = computed(() => calculateEstimatedFare(draftRouteDistanceM.value));
+const estimatedOrderPriceDisplay = computed(() =>
+  estimatedOrderPrice.value === null ? "--" : formatMoney(estimatedOrderPrice.value),
 );
 const selectedOrderRoute = computed(() => {
   const order = selectedOrder.value;
@@ -204,6 +216,16 @@ function formatDistance(distanceM: number) {
     return `${(distanceM / 1000).toFixed(2)}km`;
   }
   return `${Math.round(distanceM)}m`;
+}
+
+function calculateEstimatedFare(distanceM: number) {
+  if (!Number.isFinite(distanceM) || distanceM <= 0) {
+    return null;
+  }
+
+  const distanceKM = distanceM / 1000;
+  const estimate = Math.max(estimatedFareMinimum, estimatedFareBase + distanceKM * estimatedFarePerKM);
+  return Math.round(estimate * 100) / 100;
 }
 
 onMounted(() => {
@@ -337,7 +359,7 @@ async function createOrder() {
         destination_lat: orderForm.destination_lat,
         destination_lng: orderForm.destination_lng,
         destination_address: orderForm.destination_address,
-        estimated_price: Number(orderForm.estimated_price),
+        estimated_price: estimatedOrderPrice.value ?? 0,
       },
     });
     orders.value = [result.item, ...orders.value.filter((item) => item.id !== result.item.id)];
@@ -695,86 +717,84 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 <template>
   <div class="shell">
     <header class="hero">
-      <div>
-        <p class="eyebrow">Passenger Frontend Lab</p>
-        <h1>高德地图乘客端联调台</h1>
-        <p class="hero-copy">
-          现在这版已经接入高德地图底图和浏览器定位。我们可以直接在地图上选起终点、刷新附近司机、创建订单，
-          再观察自动派单和司机位置实时更新。
-        </p>
+      <div class="hero-brand">
+        <h1>Uber-Test测试台</h1>
       </div>
-
-      <div class="status-cluster">
-        <div class="status-pill" :data-state="socketState">
-          <span class="dot"></span>
-          WebSocket: {{ socketState }}
+      <div class="hero-nav">
+        <div class="toggle nav-toggle">
+          <button :class="{ active: authMode === 'login' }" @click="authMode = 'login'">登录</button>
+          <button :class="{ active: authMode === 'register' }" @click="authMode = 'register'">注册</button>
         </div>
-        <div class="status-pill" :data-state="mapReady ? 'open' : 'closed'">
-          <span class="dot"></span>
-          Map: {{ mapReady ? "ready" : "waiting" }}
-        </div>
-        <div v-if="session.user" class="account-pill">
-          <strong>{{ session.user.display_name || session.user.phone }}</strong>
-          <span>{{ session.user.role }}</span>
+        <div class="nav-account">
+          <div class="nav-avatar" aria-hidden="true">
+            <svg class="nav-avatar-icon" viewBox="0 0 64 64">
+              <path
+                d="M32 34c9.941 0 18-8.059 18-18S41.941-2 32-2 14 6.059 14 16s8.059 18 18 18Zm0 6C18.745 40 8 50.745 8 64h48c0-13.255-10.745-24-24-24Z"
+                transform="translate(0 2)"
+              />
+            </svg>
+          </div>
+          <div class="nav-account-copy">
+            <strong>{{ accountDisplayName }}</strong>
+            <span>{{ accountSubtitle }}</span>
+          </div>
+          <button v-if="isAuthenticated" class="ghost nav-logout" @click="logout">退出</button>
         </div>
       </div>
     </header>
 
     <main class="grid">
-      <section class="panel auth-panel">
-        <div class="panel-head">
-          <h2>账号</h2>
-          <div class="toggle">
-            <button :class="{ active: authMode === 'login' }" @click="authMode = 'login'">登录</button>
-            <button :class="{ active: authMode === 'register' }" @click="authMode = 'register'">注册</button>
-          </div>
-        </div>
-
-        <template v-if="!isAuthenticated">
-          <label>
-            手机号
-            <input v-model="authForm.phone" placeholder="13800138000" />
-          </label>
-          <label v-if="authMode === 'register'">
-            昵称
-            <input v-model="authForm.display_name" placeholder="Passenger Lab" />
-          </label>
-          <label>
-            密码
-            <input v-model="authForm.password" type="password" placeholder="pass123456" />
-          </label>
-          <button class="primary" :disabled="savingAuth" @click="submitAuth">
-            {{ savingAuth ? "提交中..." : authMode === "login" ? "登录并进入测试台" : "注册并登录" }}
-          </button>
-        </template>
-
-        <template v-else>
-          <div class="session-card">
-            <div>
-              <strong>{{ session.user?.display_name || session.user?.phone }}</strong>
-              <p>{{ session.user?.phone }}</p>
-            </div>
-            <button class="ghost" @click="logout">退出</button>
-          </div>
-          <div class="stack-buttons">
-            <button class="secondary" :disabled="locating" @click="locatePassenger()">
-              {{ locating ? "定位中..." : "定位到当前位置" }}
-            </button>
-            <button class="secondary" @click="loadOrders">刷新订单</button>
-            <button class="secondary" @click="loadNearby">刷新附近司机</button>
-          </div>
-        </template>
-
-        <div class="message-box">{{ message }}</div>
-      </section>
-
       <section class="panel map-panel">
         <div class="panel-head">
           <h2>高德地图</h2>
-          <div class="actions">
+          <div class="panel-tools">
+            <div class="status-cluster map-status-cluster">
+              <div class="status-pill" :data-state="socketState">
+                <span class="dot"></span>
+                WebSocket: {{ socketState }}
+              </div>
+              <div class="status-pill" :data-state="mapReady ? 'open' : 'closed'">
+                <span class="dot"></span>
+                Map: {{ mapReady ? "ready" : "waiting" }}
+              </div>
+            </div>
+            <div class="actions">
             <button class="ghost" :class="{ active: mapPickMode === 'pickup' }" @click="mapPickMode = 'pickup'">点地图设上车点</button>
             <button class="ghost" :class="{ active: mapPickMode === 'destination' }" @click="mapPickMode = 'destination'">点地图设目的地</button>
           </div>
+          </div>
+        </div>
+
+        <div class="map-toolbar">
+          <template v-if="!isAuthenticated">
+            <div class="inline-auth-form">
+              <label>
+                手机号
+                <input v-model="authForm.phone" placeholder="13800138000" />
+              </label>
+              <label v-if="authMode === 'register'">
+                昵称
+                <input v-model="authForm.display_name" placeholder="Passenger Lab" />
+              </label>
+              <label>
+                密码
+                <input v-model="authForm.password" type="password" placeholder="pass123456" />
+              </label>
+              <button class="primary inline-auth-submit" :disabled="savingAuth" @click="submitAuth">
+                {{ savingAuth ? "提交中..." : authMode === "login" ? "登录并进入测试台" : "注册并登录" }}
+              </button>
+            </div>
+          </template>
+          <template v-else>
+            <div class="actions toolbar-actions">
+              <button class="secondary" :disabled="locating" @click="locatePassenger()">
+                {{ locating ? "定位中..." : "定位到当前位置" }}
+              </button>
+              <button class="secondary" @click="loadOrders">刷新订单</button>
+              <button class="secondary" @click="loadNearby">刷新附近司机</button>
+            </div>
+          </template>
+          <div class="message-box toolbar-message">{{ message }}</div>
         </div>
 
         <LiveMap
@@ -811,7 +831,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
         <div class="panel-head">
           <h2>创建订单</h2>
           <div class="actions">
-            <button class="ghost" :disabled="!selectedOrderId" @click="startDraftOrder">Edit Draft</button>
+            <button class="ghost" :disabled="!selectedOrderId" @click="startDraftOrder">取消订单</button>
             <button class="primary" :disabled="savingOrder || !isAuthenticated" @click="createOrder">
             {{ savingOrder ? "创建中..." : "立即叫车" }}
           </button>
@@ -858,7 +878,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
           <label>
             预估价格
-            <input v-model.number="orderForm.estimated_price" type="number" step="1" />
+            <input :value="estimatedOrderPriceDisplay" type="text" readonly />
           </label>
         </div>
       </section>
@@ -948,20 +968,91 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 <style scoped>
 .shell {
-  max-width: 1480px;
-  margin: 0 auto;
+  width: 100%;
   padding: 32px 20px 56px;
 }
 
 .hero {
   display: flex;
   justify-content: space-between;
+  align-items: center;
   gap: 24px;
   padding: 24px 28px;
   border: 1px solid var(--line);
   border-radius: 32px;
   background: linear-gradient(135deg, rgba(255, 249, 241, 0.92), rgba(248, 241, 232, 0.86));
   box-shadow: var(--shadow);
+  width: 100%;
+}
+
+.hero-brand {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.hero-nav {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 16px;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+}
+
+.nav-toggle {
+  flex-shrink: 0;
+}
+
+.nav-account {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 22px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.76);
+  min-width: 0;
+}
+
+.nav-avatar {
+  width: 48px;
+  height: 48px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(255, 245, 235, 0.96));
+  color: var(--ink);
+  border: 1px solid rgba(31, 41, 51, 0.08);
+  box-shadow: 0 10px 24px rgba(31, 41, 51, 0.08);
+  flex-shrink: 0;
+}
+
+.nav-avatar-icon {
+  width: 28px;
+  height: 28px;
+  fill: currentColor;
+}
+
+.nav-account-copy {
+  display: grid;
+  min-width: 0;
+}
+
+.nav-account-copy strong,
+.nav-account-copy span {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nav-account-copy span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.nav-logout {
+  padding: 10px 14px;
+  flex-shrink: 0;
 }
 
 .eyebrow {
@@ -991,8 +1082,7 @@ h1 {
   min-width: 220px;
 }
 
-.status-pill,
-.account-pill {
+.status-pill {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -1016,11 +1106,32 @@ h1 {
   box-shadow: 0 0 0 6px rgba(31, 143, 99, 0.14);
 }
 
+.panel-tools {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.map-status-cluster {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: auto;
+}
+
+.map-status-cluster .status-pill {
+  min-width: 180px;
+  padding: 12px 14px;
+}
+
 .grid {
   display: grid;
   grid-template-columns: 1.05fr 1.3fr 1.1fr;
   gap: 18px;
-  margin-top: 20px;
+  max-width: 1480px;
+  margin: 20px auto 0;
 }
 
 .panel {
@@ -1033,7 +1144,7 @@ h1 {
 }
 
 .map-panel {
-  grid-column: span 2;
+  grid-column: 1 / -1;
 }
 
 .panel-head {
@@ -1150,21 +1261,33 @@ input:focus {
   color: var(--muted);
 }
 
-.session-card {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 12px;
-}
-
-.session-card p {
-  margin: 6px 0 0;
-  color: var(--muted);
-}
-
-.stack-buttons {
+.map-toolbar {
   display: grid;
   gap: 10px;
+  margin-bottom: 18px;
+}
+
+.toolbar-actions {
+  align-items: stretch;
+}
+
+.inline-auth-form {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  align-items: end;
+}
+
+.inline-auth-form label {
+  margin-bottom: 0;
+}
+
+.inline-auth-submit {
+  min-height: 50px;
+}
+
+.toolbar-message {
+  margin-top: 0;
 }
 
 .coordinate-grid {
@@ -1317,6 +1440,7 @@ input:focus {
     grid-template-columns: 1fr;
   }
 
+  .inline-auth-form,
   .coordinate-grid {
     grid-template-columns: 1fr 1fr;
   }
@@ -1329,11 +1453,21 @@ input:focus {
 
   .hero {
     flex-direction: column;
+    align-items: stretch;
     border-radius: 24px;
     padding: 20px;
   }
 
+  .hero-nav {
+    justify-content: stretch;
+  }
+
+  .nav-account {
+    width: 100%;
+  }
+
   .coordinate-grid,
+  .inline-auth-form,
   .detail-grid,
   .order-form .pair {
     grid-template-columns: 1fr;
@@ -1342,6 +1476,16 @@ input:focus {
   .panel {
     padding: 18px;
     border-radius: 22px;
+  }
+
+  .panel-tools,
+  .map-status-cluster {
+    width: 100%;
+  }
+
+  .map-status-cluster {
+    flex-direction: column;
+    align-items: stretch;
   }
 }
 </style>

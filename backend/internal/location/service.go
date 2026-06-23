@@ -120,7 +120,7 @@ func (s *Service) FindNearby(ctx context.Context, query model.NearbyQuery) ([]mo
 		query.Limit = 20
 	}
 	if query.RadiusM <= 0 {
-		query.RadiusM = 3000
+		query.RadiusM = 10000
 	}
 	query.OnlyLive = true
 

@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	defaultDispatchRadiusM = 3000
+	defaultDispatchRadiusM = 10000
 	defaultDispatchLimit   = 5
 	defaultDispatchRound   = 1
 )
