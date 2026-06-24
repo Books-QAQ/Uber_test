@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,6 +25,42 @@ type upsertDriverRouteRequest struct {
 
 func NewRouteHandler(routeService *routeplan.Service) *RouteHandler {
 	return &RouteHandler{routeService: routeService}
+}
+
+func (h *RouteHandler) GetPreview(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		return
+	}
+
+	originLat, err := parseRequiredFloatQuery(r, "origin_lat")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	originLng, err := parseRequiredFloatQuery(r, "origin_lng")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	destinationLat, err := parseRequiredFloatQuery(r, "destination_lat")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	destinationLng, err := parseRequiredFloatQuery(r, "destination_lng")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+
+	item, err := h.routeService.PlanPreview(r.Context(), originLat, originLng, destinationLat, destinationLng)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"item": item})
 }
 
 func (h *RouteHandler) UpsertByDriver(w http.ResponseWriter, r *http.Request) {
@@ -80,4 +117,16 @@ func (h *RouteHandler) GetByOrderID(w http.ResponseWriter, r *http.Request, orde
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"item": item})
+}
+
+func parseRequiredFloatQuery(r *http.Request, key string) (float64, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get(key))
+	if raw == "" {
+		return 0, errors.New("missing query parameter: " + key)
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, errors.New("invalid query parameter: " + key)
+	}
+	return value, nil
 }

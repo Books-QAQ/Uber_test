@@ -28,10 +28,12 @@ const selectedTrip = ref<Trip | null>(null);
 const socketEvents = ref<Array<{ id: number; text: string }>>([]);
 const liveDriverLocations = ref<Record<string, DriverLiveLocation>>({});
 const liveRoutes = ref<Record<string, DriverRoute>>({});
+const previewRoute = ref<DriverRoute | null>(null);
 const ws = ref<WebSocket | null>(null);
 let pollTimer: number | null = null;
 let nearbyRefreshTimer: number | null = null;
 let ordersRefreshTimer: number | null = null;
+let previewRouteTimer: number | null = null;
 let eventSeq = 0;
 
 const session = reactive<{
@@ -115,6 +117,7 @@ const selectedOrderRoute = computed(() => {
   }
   return liveRoutes.value[order.id] ?? null;
 });
+const displayRoute = computed(() => (selectedOrder.value ? selectedOrderRoute.value : previewRoute.value));
 const routeProgressCard = computed(() => {
   const order = selectedOrder.value;
   if (!order?.driver_id) {
@@ -248,8 +251,21 @@ watch(selectedOrderId, async (next) => {
   await Promise.all([loadTrip(next), loadOrderRoute(next)]);
 });
 
+watch(
+  () => [draftMode.value, orderForm.pickup_lat, orderForm.pickup_lng, orderForm.destination_lat, orderForm.destination_lng],
+  () => {
+    if (!draftMode.value) {
+      previewRoute.value = null;
+      return;
+    }
+    scheduleLoadPreviewRoute(180);
+  },
+  { deep: false },
+);
+
 async function bootstrapAuthedView() {
   await Promise.all([locatePassenger(true), loadOrders(), loadNearby()]);
+  await loadPreviewRoute();
   connectSocket();
   startPolling();
 }
@@ -433,6 +449,34 @@ async function loadOrderRoute(orderId: string) {
   }
 }
 
+async function loadPreviewRoute() {
+  if (!draftMode.value) {
+    previewRoute.value = null;
+    return;
+  }
+  if (!isAuthenticated.value) {
+    previewRoute.value = null;
+    return;
+  }
+  if (distanceMeters(orderForm.pickup_lat, orderForm.pickup_lng, orderForm.destination_lat, orderForm.destination_lng) <= 1) {
+    previewRoute.value = null;
+    return;
+  }
+
+  try {
+    const query = new URLSearchParams({
+      origin_lat: String(orderForm.pickup_lat),
+      origin_lng: String(orderForm.pickup_lng),
+      destination_lat: String(orderForm.destination_lat),
+      destination_lng: String(orderForm.destination_lng),
+    });
+    const result = await api<{ item: DriverRoute }>(`/api/v1/routes/preview?${query.toString()}`);
+    previewRoute.value = result.item;
+  } catch {
+    previewRoute.value = null;
+  }
+}
+
 function startDraftOrder() {
   if (draftMode.value && !selectedOrderId.value) {
     return;
@@ -440,6 +484,7 @@ function startDraftOrder() {
   draftMode.value = true;
   selectedOrderId.value = "";
   selectedTrip.value = null;
+  scheduleLoadPreviewRoute(50);
   message.value = "已切换到新订单草稿，当前可以重新设置上车点和目的地。";
 }
 
@@ -499,6 +544,10 @@ function stopPolling() {
   if (ordersRefreshTimer !== null) {
     window.clearTimeout(ordersRefreshTimer);
     ordersRefreshTimer = null;
+  }
+  if (previewRouteTimer !== null) {
+    window.clearTimeout(previewRouteTimer);
+    previewRouteTimer = null;
   }
 }
 
@@ -593,6 +642,16 @@ function scheduleLoadNearby(delayMs = 0) {
   }, delayMs);
 }
 
+function scheduleLoadPreviewRoute(delayMs = 0) {
+  if (previewRouteTimer !== null) {
+    window.clearTimeout(previewRouteTimer);
+  }
+  previewRouteTimer = window.setTimeout(() => {
+    previewRouteTimer = null;
+    void loadPreviewRoute();
+  }, delayMs);
+}
+
 function pushEvent(text: string) {
   socketEvents.value = [{ id: ++eventSeq, text }, ...socketEvents.value].slice(0, 20);
 }
@@ -624,6 +683,7 @@ function logout() {
   selectedTrip.value = null;
   liveDriverLocations.value = {};
   liveRoutes.value = {};
+  previewRoute.value = null;
   localStorage.removeItem(storageKey);
   disconnectSocket();
   stopPolling();
@@ -804,8 +864,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
           :destination-lng="mapDestinationLng"
           :drivers="displayDrivers"
           :live-driver-locations="liveDriverLocations"
-          :actual-route="selectedOrderRoute"
-          :current-order="selectedOrder"
+          :route-data="displayRoute"
           :pick-mode="mapPickMode"
           @pick-location="onMapPicked"
           @ready="mapReady = true"

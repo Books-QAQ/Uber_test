@@ -59,7 +59,7 @@ curl http://127.0.0.1:8080/healthz
 
 - `frontend-passenger/`
 
-先配置高德地图环境变量。新建文件：
+先配置前端高德地图环境变量。新建文件：
 
 - `frontend-passenger/.env.local`
 
@@ -70,6 +70,27 @@ VITE_AMAP_KEY=你的高德Web端JSAPIKey
 VITE_AMAP_SECURITY_JS_CODE=你的安全密钥
 VITE_AMAP_MAP_STYLE=amap://styles/normal
 ```
+
+如果你现在已经把“路线规划”下沉到了后端，还需要同时配置后端算路环境变量。
+
+编辑文件：
+
+- `backend/configs/config.example.env`
+
+关键项如下：
+
+```env
+ROUTE_AMAP_WEB_KEY=你的高德Web服务Key
+ROUTE_OSRM_BASE_URL=http://router.project-osrm.org
+ROUTE_REQUEST_TIMEOUT=5s
+```
+
+说明：
+
+- `VITE_AMAP_KEY` 是前端地图底图用的
+- `ROUTE_AMAP_WEB_KEY` 是后端调用高德路径规划 REST 接口用的
+- 如果后端高德路线不可用，会自动回退到 `ROUTE_OSRM_BASE_URL`
+- `ROUTE_REQUEST_TIMEOUT` 建议先用 `5s`
 
 然后安装依赖并启动：
 
@@ -137,4 +158,3 @@ go run ./cmd/driver-sim `
 5. 在地图上设置上车点和目的地
 6. 创建订单
 7. 观察自动派单、司机移动、WebSocket 实时更新
-

@@ -69,8 +69,6 @@ type routePoint struct {
 type driverAgent struct {
 	apiBase       string
 	udpAddr       string
-	amapWebKey    string
-	osrmBaseURL   string
 	httpClient    *http.Client
 	displayName   string
 	phone         string
@@ -99,7 +97,6 @@ type driverAgent struct {
 	idlePhase    float64
 	routeMode    string
 	routeOrderID string
-	routeTarget  routePoint
 	routePath    []routePoint
 }
 
@@ -117,8 +114,6 @@ func main() {
 		password      = flag.String("password", "pass123456", "password for simulated drivers")
 		centerLat     = flag.Float64("lat", 31.2304, "base latitude")
 		centerLng     = flag.Float64("lng", 121.4737, "base longitude")
-		amapWebKey    = flag.String("amap-web-key", "", "Amap web service key used for driving route simulation")
-		osrmBaseURL   = flag.String("osrm-base-url", "http://router.project-osrm.org", "OSRM base URL used as fallback route provider")
 		radiusMeters  = flag.Float64("radius-m", 700, "orbit radius in meters")
 		speedStep     = flag.Float64("speed-step", 0.15, "orbit speed multiplier")
 		autoAccept    = flag.Bool("auto-accept", true, "automatically accept incoming dispatches")
@@ -132,8 +127,6 @@ func main() {
 	)
 	flag.Parse()
 
-	resolvedAmapWebKey := resolveAmapWebKey(strings.TrimSpace(*amapWebKey))
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -143,8 +136,6 @@ func main() {
 		agents = append(agents, &driverAgent{
 			apiBase:       strings.TrimRight(*apiBase, "/"),
 			udpAddr:       *udpAddr,
-			amapWebKey:    resolvedAmapWebKey,
-			osrmBaseURL:   strings.TrimRight(strings.TrimSpace(*osrmBaseURL), "/"),
 			httpClient:    &http.Client{Timeout: 10 * time.Second},
 			displayName:   fmt.Sprintf("Sim Driver %d", i+1),
 			phone:         fmt.Sprintf("%s%04d", *phonePrefix, i+1),
@@ -171,14 +162,6 @@ func main() {
 			log.Fatalf("bootstrap %s failed: %v", agent.displayName, err)
 		}
 		log.Printf("%s ready phone=%s driver_id=%s", agent.displayName, agent.phone, agent.driverID)
-		switch {
-		case agent.amapWebKey != "":
-			log.Printf("%s route planner provider=amap", agent.displayName)
-		case agent.osrmBaseURL != "":
-			log.Printf("%s route planner provider=osrm fallback=%s", agent.displayName, agent.osrmBaseURL)
-		default:
-			log.Printf("%s route planner disabled; set AMAP_WEB_SERVICE_KEY or configure -osrm-base-url to enable road-following movement", agent.displayName)
-		}
 	}
 
 	var wg sync.WaitGroup
@@ -325,9 +308,6 @@ func (a *driverAgent) syncAndDriveOrder(ctx context.Context) error {
 
 	if shouldClearRoute {
 		a.clearRouteState()
-		if err := a.clearRoutePlan(ctx); err != nil {
-			log.Printf("%s clear route plan failed: %v", a.displayName, err)
-		}
 	}
 
 	if current == nil {
@@ -353,12 +333,24 @@ func (a *driverAgent) syncAndDriveOrder(ctx context.Context) error {
 		a.mu.Lock()
 		a.current = &trackedOrder{Order: orderItem, StatusSince: time.Now().UTC()}
 		a.mu.Unlock()
+		if err := a.refreshRouteFromBackend(ctx, orderItem); err != nil {
+			log.Printf("%s initial route fetch failed: %v", a.displayName, err)
+		}
 		log.Printf("%s accepted order %s", a.displayName, orderItem.ID)
 		return nil
 	}
 
 	if !a.autoProgress || tracked == nil {
+		if tracked != nil {
+			if err := a.refreshRouteFromBackend(ctx, tracked.Order); err != nil {
+				log.Printf("%s backend route sync failed: %v", a.displayName, err)
+			}
+		}
 		return nil
+	}
+
+	if err := a.refreshRouteFromBackend(ctx, tracked.Order); err != nil {
+		log.Printf("%s backend route sync failed: %v", a.displayName, err)
 	}
 
 	now := time.Now().UTC()
@@ -394,6 +386,9 @@ func (a *driverAgent) progressOrder(ctx context.Context, orderID string, input m
 	a.mu.Lock()
 	a.current = &trackedOrder{Order: orderItem, StatusSince: time.Now().UTC()}
 	a.mu.Unlock()
+	if err := a.refreshRouteFromBackend(ctx, orderItem); err != nil {
+		log.Printf("%s route refresh after %s failed: %v", a.displayName, action, err)
+	}
 	log.Printf("%s %s order %s => %s", a.displayName, action, orderID, orderItem.Status)
 	return nil
 }
@@ -431,6 +426,48 @@ func (a *driverAgent) listDispatches(ctx context.Context) ([]model.DispatchAssig
 		return nil, fmt.Errorf("decode dispatches: %w", err)
 	}
 	return result.Items, nil
+}
+
+func (a *driverAgent) refreshRouteFromBackend(ctx context.Context, orderItem model.Order) error {
+	if orderItem.ID == "" {
+		a.clearRouteState()
+		return nil
+	}
+	if orderItem.Status != model.OrderStatusAccepted && orderItem.Status != model.OrderStatusDriverArrived && orderItem.Status != model.OrderStatusInTrip {
+		a.clearRouteState()
+		return nil
+	}
+
+	status, body, err := a.doJSON(ctx, http.MethodGet, fmt.Sprintf("/api/v1/orders/%s/route", orderItem.ID), a.token, nil)
+	if err != nil {
+		return err
+	}
+	if status == http.StatusNotFound {
+		a.clearRouteState()
+		return nil
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("get backend route: status=%d body=%s", status, string(body))
+	}
+
+	var result struct {
+		Item model.DriverRoute `json:"item"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return fmt.Errorf("decode backend route: %w", err)
+	}
+
+	nextPath := make([]routePoint, 0, len(result.Item.Points))
+	for _, point := range result.Item.Points {
+		nextPath = append(nextPath, routePoint{Lat: point.Lat, Lng: point.Lng})
+	}
+
+	a.mu.Lock()
+	a.routeMode = result.Item.Mode
+	a.routeOrderID = orderItem.ID
+	a.routePath = nextPath
+	a.mu.Unlock()
+	return nil
 }
 
 func (a *driverAgent) updateOrderStatus(ctx context.Context, orderID string, input model.UpdateOrderStatusInput) (model.Order, error) {
@@ -534,11 +571,10 @@ func (a *driverAgent) nextPosition() (float64, float64, float64, float64) {
 	} else {
 		if linearDistanceMeters(a.currentLat, a.currentLng, targetLat, targetLng) <= a.arriveWithinM {
 			a.routeMode = mode
-			a.routeTarget = routePoint{Lat: targetLat, Lng: targetLng}
 			a.routePath = nil
 			a.currentLat = targetLat
 			a.currentLng = targetLng
-		} else if a.ensureRouteLocked(mode, targetLat, targetLng) {
+		} else if a.ensureRouteLocked(mode) {
 			a.currentLat, a.currentLng = followRoute(a.currentLat, a.currentLng, &a.routePath, stepM)
 		} else {
 			a.currentLat, a.currentLng = moveTowards(a.currentLat, a.currentLng, targetLat, targetLng, stepM)
@@ -549,35 +585,11 @@ func (a *driverAgent) nextPosition() (float64, float64, float64, float64) {
 	return a.currentLat, a.currentLng, heading, speedKPH
 }
 
-func (a *driverAgent) ensureRouteLocked(mode string, targetLat, targetLng float64) bool {
-	if a.amapWebKey == "" && a.osrmBaseURL == "" {
+func (a *driverAgent) ensureRouteLocked(mode string) bool {
+	if a.current == nil {
 		return false
 	}
-
-	needRefresh := a.routeMode != mode || len(a.routePath) == 0 || linearDistanceMeters(a.routeTarget.Lat, a.routeTarget.Lng, targetLat, targetLng) > 20
-	if !needRefresh {
-		return true
-	}
-
-	path, err := a.fetchRoute(a.currentLat, a.currentLng, targetLat, targetLng)
-	if err != nil {
-		log.Printf("%s route fetch failed: %v", a.displayName, err)
-		return false
-	}
-	if len(path) == 0 {
-		return false
-	}
-
-	a.routeMode = mode
-	if a.current != nil {
-		a.routeOrderID = a.current.Order.ID
-	}
-	a.routeTarget = routePoint{Lat: targetLat, Lng: targetLng}
-	a.routePath = path
-	if err := a.uploadRoutePlan(context.Background(), a.routeOrderID, mode, path); err != nil {
-		log.Printf("%s route upload failed: %v", a.displayName, err)
-	}
-	return true
+	return a.routeMode == mode && a.routeOrderID == a.current.Order.ID && len(a.routePath) > 0
 }
 
 func (a *driverAgent) clearRouteState() {
@@ -585,58 +597,7 @@ func (a *driverAgent) clearRouteState() {
 	defer a.mu.Unlock()
 	a.routeMode = ""
 	a.routeOrderID = ""
-	a.routeTarget = routePoint{}
 	a.routePath = nil
-}
-
-func (a *driverAgent) uploadRoutePlan(ctx context.Context, orderID, mode string, path []routePoint) error {
-	if orderID == "" {
-		return nil
-	}
-
-	points := make([]model.RoutePoint, 0, len(path))
-	for _, point := range path {
-		points = append(points, model.RoutePoint{
-			Lat: point.Lat,
-			Lng: point.Lng,
-		})
-	}
-
-	var result struct {
-		Item model.DriverRoute `json:"item"`
-	}
-	return a.decodeJSON(ctx, http.MethodPost, fmt.Sprintf("/api/v1/drivers/%s/route", a.driverID), a.token, map[string]any{
-		"order_id": orderID,
-		"mode":     mode,
-		"points":   points,
-	}, &result)
-}
-
-func (a *driverAgent) clearRoutePlan(ctx context.Context) error {
-	var result struct {
-		Item model.DriverRoute `json:"item"`
-	}
-	return a.decodeJSON(ctx, http.MethodPost, fmt.Sprintf("/api/v1/drivers/%s/route", a.driverID), a.token, map[string]any{
-		"points": []model.RoutePoint{},
-	}, &result)
-}
-
-func (a *driverAgent) fetchRoute(originLat, originLng, destinationLat, destinationLng float64) ([]routePoint, error) {
-	if a.amapWebKey != "" {
-		path, err := fetchAMapDrivingRoute(a.httpClient, a.amapWebKey, originLat, originLng, destinationLat, destinationLng)
-		if err == nil && len(path) > 0 {
-			return path, nil
-		}
-		if a.osrmBaseURL == "" {
-			return nil, err
-		}
-		log.Printf("%s amap route unavailable, falling back to osrm: %v", a.displayName, err)
-	}
-
-	if a.osrmBaseURL == "" {
-		return nil, errors.New("no route provider configured")
-	}
-	return fetchOSRMRoute(a.httpClient, a.osrmBaseURL, originLat, originLng, destinationLat, destinationLng)
 }
 
 func (a *driverAgent) distanceTo(lat, lng float64) float64 {

@@ -222,6 +222,22 @@ func (s *RedisStore) ListLatest(ctx context.Context) ([]model.DriverLocation, er
 	return items, nil
 }
 
+func (s *RedisStore) GetLatestByDriverID(ctx context.Context, driverID string) (model.DriverLocation, error) {
+	payload, err := s.client.Get(ctx, s.latestKey(driverID)).Result()
+	if err == redis.Nil {
+		return model.DriverLocation{}, ErrNotFound
+	}
+	if err != nil {
+		return model.DriverLocation{}, fmt.Errorf("read latest location by driver: %w", err)
+	}
+
+	var location model.DriverLocation
+	if err := json.Unmarshal([]byte(payload), &location); err != nil {
+		return model.DriverLocation{}, fmt.Errorf("unmarshal latest location by driver: %w", err)
+	}
+	return location, nil
+}
+
 func (s *RedisStore) FindNearby(ctx context.Context, query model.NearbyQuery) ([]model.NearbyDriver, error) {
 	if query.RadiusM <= 0 {
 		query.RadiusM = 3000

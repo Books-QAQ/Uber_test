@@ -15,6 +15,7 @@ type Service struct {
 	driverStatusWriter DriverStatusWriter
 	tripLifecycle      TripLifecycleWriter
 	dispatcher         DispatchCoordinator
+	routeCoordinator   RouteCoordinator
 }
 
 type DriverStatusWriter interface {
@@ -32,6 +33,10 @@ type DispatchCoordinator interface {
 	ClosePendingByOrderID(ctx context.Context, orderID, status string) error
 }
 
+type RouteCoordinator interface {
+	SyncOrder(ctx context.Context, order model.Order) error
+}
+
 func NewService(store Store, driverStatusWriter DriverStatusWriter, tripLifecycle TripLifecycleWriter, dispatcher DispatchCoordinator) *Service {
 	return &Service{
 		store:              store,
@@ -39,6 +44,10 @@ func NewService(store Store, driverStatusWriter DriverStatusWriter, tripLifecycl
 		tripLifecycle:      tripLifecycle,
 		dispatcher:         dispatcher,
 	}
+}
+
+func (s *Service) SetRouteCoordinator(routeCoordinator RouteCoordinator) {
+	s.routeCoordinator = routeCoordinator
 }
 
 func (s *Service) Create(ctx context.Context, input model.CreateOrderInput) (model.Order, error) {
@@ -165,6 +174,9 @@ func (s *Service) UpdateStatus(ctx context.Context, id string, input model.Updat
 	if err := s.syncDriverStatus(ctx, order, input.Status); err != nil {
 		return model.Order{}, err
 	}
+	if err := s.syncRoute(ctx, order); err != nil {
+		return model.Order{}, err
+	}
 
 	return order, nil
 }
@@ -289,6 +301,13 @@ func (s *Service) syncDispatch(ctx context.Context, order model.Order, status st
 	default:
 		return nil
 	}
+}
+
+func (s *Service) syncRoute(ctx context.Context, order model.Order) error {
+	if s.routeCoordinator == nil {
+		return nil
+	}
+	return s.routeCoordinator.SyncOrder(ctx, order)
 }
 
 func isValidOrderTransition(from, to string) bool {

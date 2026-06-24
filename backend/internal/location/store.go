@@ -163,6 +163,17 @@ func (s *MemoryStore) ListLatest(_ context.Context) ([]model.DriverLocation, err
 	return items, nil
 }
 
+func (s *MemoryStore) GetLatestByDriverID(_ context.Context, driverID string) (model.DriverLocation, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	location, ok := s.latest[driverID]
+	if !ok {
+		return model.DriverLocation{}, ErrNotFound
+	}
+	return location, nil
+}
+
 func (s *MemoryStore) ListRecent(_ context.Context, driverID string) ([]model.DriverLocation, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

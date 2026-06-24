@@ -17,8 +17,14 @@ type Broadcaster interface {
 	BroadcastJSON(v any)
 }
 
+type RouteCoordinator interface {
+	SyncDriverLocation(ctx context.Context, location model.DriverLocation) error
+	ClearByDriverID(ctx context.Context, driverID string) error
+}
+
 type Service struct {
 	store       Store
+	routeSync   RouteCoordinator
 	broadcaster Broadcaster
 	logger      *slog.Logger
 }
@@ -32,6 +38,10 @@ func NewService(store Store, broadcaster Broadcaster, logger *slog.Logger) *Serv
 		broadcaster: broadcaster,
 		logger:      logger,
 	}
+}
+
+func (s *Service) SetRouteCoordinator(routeSync RouteCoordinator) {
+	s.routeSync = routeSync
 }
 
 func (s *Service) HandlePacket(ctx context.Context, remoteAddr netip.AddrPort, payload []byte) error {
@@ -59,6 +69,11 @@ func (s *Service) HandlePacket(ctx context.Context, remoteAddr netip.AddrPort, p
 			if err := s.store.Upsert(ctx, message.Locations[0]); err != nil {
 				return err
 			}
+			if s.routeSync != nil {
+				if err := s.routeSync.SyncDriverLocation(ctx, message.Locations[0]); err != nil {
+					s.logger.Warn("sync route for driver location failed", "driver_id", message.Locations[0].DriverID, "error", err)
+				}
+			}
 			s.broadcaster.BroadcastJSON(map[string]any{
 				"type": "driver.location.updated",
 				"data": message.Locations[0],
@@ -69,6 +84,13 @@ func (s *Service) HandlePacket(ctx context.Context, remoteAddr netip.AddrPort, p
 
 		if err := s.store.UpsertBatch(ctx, message.Locations); err != nil {
 			return err
+		}
+		if s.routeSync != nil {
+			for _, location := range message.Locations {
+				if err := s.routeSync.SyncDriverLocation(ctx, location); err != nil {
+					s.logger.Warn("sync route for batch driver location failed", "driver_id", location.DriverID, "error", err)
+				}
+			}
 		}
 		s.broadcaster.BroadcastJSON(map[string]any{
 			"type":  "driver.location.batch.updated",
@@ -99,6 +121,13 @@ func (s *Service) HandlePacket(ctx context.Context, remoteAddr netip.AddrPort, p
 
 func (s *Service) ListLatest(ctx context.Context) ([]model.DriverLocation, error) {
 	return s.store.ListLatest(ctx)
+}
+
+func (s *Service) GetLatestByDriverID(ctx context.Context, driverID string) (model.DriverLocation, error) {
+	if driverID == "" {
+		return model.DriverLocation{}, fmt.Errorf("get latest driver location: missing driver_id")
+	}
+	return s.store.GetLatestByDriverID(ctx, driverID)
 }
 
 func (s *Service) SetDriverStatus(ctx context.Context, status model.DriverStatus) error {

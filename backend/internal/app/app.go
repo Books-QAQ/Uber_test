@@ -102,9 +102,16 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	}
 	locationService := location.NewService(locationStore, hub, logger)
 	tripService := trip.NewService(tripStore)
+	routePlanner := routeplan.NewHTTPPlanner(routeplan.PlannerConfig{
+		AMapWebKey:     cfg.RouteAMapWebKey,
+		OSRMBaseURL:    cfg.RouteOSRMBaseURL,
+		RequestTimeout: cfg.RouteRequestTimeout,
+	})
+	routeService := routeplan.NewService(routeStore, orderStore, locationService, routePlanner, hub, logger)
 	dispatchService := dispatch.NewService(dispatchStore, orderStore, locationService, hub, logger)
-	routeService := routeplan.NewService(routeStore, hub, logger)
 	orderService := order.NewService(orderStore, locationService, tripService, dispatchService)
+	locationService.SetRouteCoordinator(routeService)
+	orderService.SetRouteCoordinator(routeService)
 
 	router := httpapi.NewRouter(httpapi.RouterDeps{
 		Logger:          logger,
@@ -199,6 +206,11 @@ func (a *App) runDriverMaintenanceLoop(ctx context.Context) {
 					}
 					if err := a.dispatchService.HandleDriverExpired(ctx, item.DriverID); err != nil {
 						a.logger.Error("handle expired driver dispatch cleanup failed", "driver_id", item.DriverID, "error", err)
+					}
+					if a.routeService != nil {
+						if err := a.routeService.ClearByDriverID(ctx, item.DriverID); err != nil {
+							a.logger.Error("clear route for expired driver failed", "driver_id", item.DriverID, "error", err)
+						}
 					}
 				}
 			}

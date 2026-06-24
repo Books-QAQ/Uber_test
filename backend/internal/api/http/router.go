@@ -53,6 +53,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 	mux.HandleFunc("/api/v1/healthz", healthHandler.Get)
 	mux.HandleFunc("/api/v1/auth/register", authHandler.Register)
 	mux.HandleFunc("/api/v1/auth/login", authHandler.Login)
+	mux.HandleFunc("/api/v1/routes/preview", routeHandler.GetPreview)
 	mux.Handle("/api/v1/auth/me", requireAuth(http.HandlerFunc(authHandler.Me)))
 	mux.Handle("/api/v1/drivers/", requireAuth(middleware.RequireRoles(model.RoleDriver, model.RoleAdmin)(http.HandlerFunc(routeDriverSubresources(driverHandler, orderHandler, dispatchHandler, routeHandler)))))
 	mux.Handle("/api/v1/drivers/nearby", requireAuth(middleware.RequireRoles(model.RolePassenger, model.RoleDriver, model.RoleAdmin)(http.HandlerFunc(driverHandler.ListNearby))))

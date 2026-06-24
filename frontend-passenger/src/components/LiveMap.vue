@@ -2,7 +2,7 @@
 import AMapLoader from "@amap/amap-jsapi-loader";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
-import type { DriverLiveLocation, DriverRoute, NearbyDriver, Order } from "../types";
+import type { DriverLiveLocation, DriverRoute, NearbyDriver } from "../types";
 
 type MapClickPayload = {
   mode: "pickup" | "destination";
@@ -17,9 +17,8 @@ const props = defineProps<{
   destinationLng: number;
   drivers: NearbyDriver[];
   liveDriverLocations: Record<string, DriverLiveLocation>;
-  actualRoute: DriverRoute | null;
+  routeData: DriverRoute | null;
   pickMode: "pickup" | "destination";
-  currentOrder: Order | null;
 }>();
 
 const emit = defineEmits<{
@@ -37,32 +36,16 @@ const amapSecurityJsCode = (import.meta.env.VITE_AMAP_SECURITY_JS_CODE as string
 const amapStyle = (import.meta.env.VITE_AMAP_MAP_STYLE as string | undefined)?.trim() || "amap://styles/normal";
 const autoFitCooldownMs = 60_000;
 const driverAnimationDurationMs = 700;
-const routeDeviationRefreshM = 20;
-const routeDeviationCooldownMs = 4_000;
 
 let map: any = null;
 let AMap: any = null;
 let pickupMarker: any = null;
 let destinationMarker: any = null;
 let routeLine: any = null;
-let driving: any = null;
 let driverMarkers = new Map<string, any>();
 let clickHandler: ((event: any) => void) | null = null;
 let lastFitAt = 0;
 let pendingFitTimer: number | null = null;
-let routeSignature = "";
-let activeRouteRequestId = 0;
-let plannedRoutePath: Array<[number, number]> = [];
-let consumedRouteIndex = 0;
-let lastRouteRefreshAt = 0;
-
-type RoutePlan = {
-  origin: [number, number];
-  destination: [number, number];
-  mode: "preview" | "pickup" | "trip";
-  signature: string;
-  driverPosition?: [number, number];
-};
 
 const mergedDrivers = computed(() =>
   props.drivers.map((driver) => {
@@ -100,7 +83,7 @@ onMounted(async () => {
     AMap = await AMapLoader.load({
       key: amapKey,
       version: "2.0",
-      plugins: ["AMap.Scale", "AMap.ToolBar", "AMap.Driving", "AMap.MoveAnimation"],
+      plugins: ["AMap.Scale", "AMap.ToolBar", "AMap.MoveAnimation"],
     });
 
     if (!mapHost.value) {
@@ -135,13 +118,6 @@ onMounted(async () => {
     };
     map.on("click", clickHandler);
 
-    driving = new AMap.Driving({
-      hideMarkers: true,
-      autoFitView: false,
-      showTraffic: false,
-      policy: AMap?.DrivingPolicy?.LEAST_TIME,
-    });
-
     syncMarkers();
     fitView();
     loadState.value = "ready";
@@ -161,7 +137,6 @@ onBeforeUnmount(() => {
     window.clearTimeout(pendingFitTimer);
     pendingFitTimer = null;
   }
-  driving?.clear?.();
   driverMarkers.forEach((marker) => {
     marker?.stopMove?.();
     map?.remove?.(marker);
@@ -179,8 +154,7 @@ watch(
     props.destinationLng,
     props.drivers,
     props.liveDriverLocations,
-    props.actualRoute,
-    props.currentOrder,
+    props.routeData,
   ],
   () => {
     syncMarkers();
@@ -233,8 +207,11 @@ function syncMarkers() {
     }
   });
 
+  routeLine.setPath(
+    props.routeData?.points?.map((point) => [point.lng, point.lat])?.filter((point) => point.length === 2) ?? [],
+  );
+
   scheduleFitView();
-  syncRouteLine();
 }
 
 function upsertStaticMarker(marker: any, position: [number, number], content: string) {
@@ -309,13 +286,6 @@ function samePosition(a: [number, number], b: [number, number]) {
   return Math.abs(a[0] - b[0]) < 0.000001 && Math.abs(a[1] - b[1]) < 0.000001;
 }
 
-function distanceMeters(a: [number, number], b: [number, number]) {
-  const midLatRad = ((a[1] + b[1]) / 2) * Math.PI / 180;
-  const lngMeters = (b[0] - a[0]) * 111320 * Math.cos(midLatRad);
-  const latMeters = (b[1] - a[1]) * 111320;
-  return Math.hypot(latMeters, lngMeters);
-}
-
 function fitView() {
   if (!map) {
     return;
@@ -349,317 +319,6 @@ function scheduleFitView() {
     pendingFitTimer = null;
     fitView();
   }, remaining);
-}
-
-function syncRouteLine() {
-  const plan = currentRoutePlan();
-  if (!plan || !driving) {
-    clearRouteState();
-    return;
-  }
-
-  const actualPath = currentActualRoutePath(plan);
-  if (actualPath) {
-    const actualSignature = `actual:${props.actualRoute?.order_id ?? ""}:${props.actualRoute?.mode ?? ""}:${props.actualRoute?.updated_at ?? ""}`;
-    if (routeSignature !== actualSignature) {
-      routeSignature = actualSignature;
-      plannedRoutePath = dedupePath(actualPath);
-      consumedRouteIndex = 0;
-      lastRouteRefreshAt = Date.now();
-      activeRouteRequestId += 1;
-    }
-    renderRoutePath(plan, plannedRoutePath);
-    return;
-  }
-
-  if (shouldRefreshRouteForDeviation(plan)) {
-    refreshDrivingRoute(plan);
-    if (plannedRoutePath.length === 0) {
-      renderRoutePath(plan, [plan.origin, plan.destination]);
-    }
-    return;
-  }
-
-  if (plan.signature !== routeSignature || plannedRoutePath.length === 0) {
-    refreshDrivingRoute(plan);
-    if (plannedRoutePath.length === 0) {
-      renderRoutePath(plan, [plan.origin, plan.destination]);
-    }
-    return;
-  }
-
-  renderRoutePath(plan, plannedRoutePath);
-}
-
-function clearRouteState() {
-  routeSignature = "";
-  plannedRoutePath = [];
-  consumedRouteIndex = 0;
-  lastRouteRefreshAt = 0;
-  activeRouteRequestId += 1;
-  driving?.clear?.();
-  setFallbackRoute([]);
-}
-
-function refreshDrivingRoute(plan: RoutePlan) {
-  if (!driving) {
-    return;
-  }
-
-  routeSignature = plan.signature;
-  plannedRoutePath = [];
-  consumedRouteIndex = 0;
-  lastRouteRefreshAt = Date.now();
-  const requestID = ++activeRouteRequestId;
-  driving.search(plan.origin, plan.destination, (status: string, result: any) => {
-    if (requestID !== activeRouteRequestId) {
-      return;
-    }
-    if (status !== "complete") {
-      console.warn("driving route search failed:", status);
-      plannedRoutePath = dedupePath([plan.origin, plan.destination]);
-      renderRoutePath(plan, plannedRoutePath);
-      return;
-    }
-    const plannedPath = extractDrivingPath(result);
-    plannedRoutePath = dedupePath(plannedPath.length > 0 ? plannedPath : [plan.origin, plan.destination]);
-
-    const latestPlan = currentRoutePlan();
-    if (!latestPlan || latestPlan.signature !== plan.signature) {
-      return;
-    }
-    renderRoutePath(latestPlan, plannedRoutePath);
-  });
-}
-
-function renderRoutePath(plan: RoutePlan, path: Array<[number, number]>) {
-  const normalized = dedupePath(path);
-  if (normalized.length === 0) {
-    setFallbackRoute([]);
-    return;
-  }
-
-  if (plan.mode === "preview" || !plan.driverPosition) {
-    setFallbackRoute(normalized);
-    return;
-  }
-
-  setFallbackRoute(trimDrivenPath(normalized, plan.driverPosition));
-}
-
-function currentActualRoutePath(plan: RoutePlan) {
-  const route = props.actualRoute;
-  const order = props.currentOrder;
-  if (!route || !order || !order.driver_id || plan.mode === "preview") {
-    return null;
-  }
-  if (route.order_id !== order.id || route.driver_id !== order.driver_id) {
-    return null;
-  }
-  if (route.mode && route.mode !== plan.mode) {
-    return null;
-  }
-
-  const points = route.points
-    .map((point) => [point.lng, point.lat] as [number, number])
-    .filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]));
-  return points.length > 0 ? dedupePath(points) : null;
-}
-
-function shouldRefreshRouteForDeviation(plan: RoutePlan) {
-  if (plan.mode === "preview" || !plan.driverPosition || plannedRoutePath.length < 2) {
-    return false;
-  }
-  if (plan.signature !== routeSignature) {
-    return false;
-  }
-  if (Date.now() - lastRouteRefreshAt < routeDeviationCooldownMs) {
-    return false;
-  }
-  return distanceToPathMeters(plan.driverPosition, plannedRoutePath) > routeDeviationRefreshM;
-}
-
-function trimDrivenPath(path: Array<[number, number]>, driverPosition: [number, number]) {
-  if (path.length === 0) {
-    return [driverPosition];
-  }
-
-  if (path.length === 1) {
-    return dedupePath([driverPosition, path[0]]);
-  }
-
-  const startIndex = Math.max(0, Math.min(consumedRouteIndex, path.length - 2));
-  let nearestSegmentIndex = startIndex;
-  let nearestProjection = path[startIndex];
-  let nearestDistance = Number.POSITIVE_INFINITY;
-
-  for (let index = startIndex; index < path.length - 1; index += 1) {
-    const projection = projectPointToSegment(driverPosition, path[index], path[index + 1]);
-    if (projection.distance < nearestDistance) {
-      nearestDistance = projection.distance;
-      nearestSegmentIndex = index;
-      nearestProjection = projection.point;
-    }
-  }
-
-  consumedRouteIndex = Math.max(consumedRouteIndex, nearestSegmentIndex);
-  const visiblePath: Array<[number, number]> = [driverPosition];
-  if (!samePosition(visiblePath[visiblePath.length - 1], nearestProjection)) {
-    visiblePath.push(nearestProjection);
-  }
-  for (const point of path.slice(consumedRouteIndex + 1)) {
-    if (!samePosition(visiblePath[visiblePath.length - 1], point)) {
-      visiblePath.push(point);
-    }
-  }
-  return visiblePath;
-}
-
-function projectPointToSegment(point: [number, number], start: [number, number], end: [number, number]) {
-  const midLatRad = ((start[1] + end[1] + point[1]) / 3) * Math.PI / 180;
-  const scaleX = 111320 * Math.cos(midLatRad);
-  const scaleY = 111320;
-
-  const sx = start[0] * scaleX;
-  const sy = start[1] * scaleY;
-  const ex = end[0] * scaleX;
-  const ey = end[1] * scaleY;
-  const px = point[0] * scaleX;
-  const py = point[1] * scaleY;
-
-  const dx = ex - sx;
-  const dy = ey - sy;
-  const lengthSquared = dx * dx + dy * dy;
-  if (lengthSquared === 0) {
-    return {
-      point: start,
-      distance: distanceMeters(point, start),
-    };
-  }
-
-  const ratio = Math.max(0, Math.min(1, ((px-sx)*dx + (py-sy)*dy) / lengthSquared));
-  const projected: [number, number] = [
-    start[0] + (end[0] - start[0]) * ratio,
-    start[1] + (end[1] - start[1]) * ratio,
-  ];
-  return {
-    point: projected,
-    distance: distanceMeters(point, projected),
-  };
-}
-
-function distanceToPathMeters(point: [number, number], path: Array<[number, number]>) {
-  if (path.length === 0) {
-    return Number.POSITIVE_INFINITY;
-  }
-  if (path.length === 1) {
-    return distanceMeters(point, path[0]);
-  }
-
-  let best = Number.POSITIVE_INFINITY;
-  for (let index = 0; index < path.length - 1; index += 1) {
-    const projection = projectPointToSegment(point, path[index], path[index + 1]);
-    if (projection.distance < best) {
-      best = projection.distance;
-    }
-  }
-  return best;
-}
-
-function dedupePath(path: Array<[number, number]>) {
-  const normalized: Array<[number, number]> = [];
-  for (const point of path) {
-    const prev = normalized[normalized.length - 1];
-    if (!prev || !samePosition(prev, point)) {
-      normalized.push(point);
-    }
-  }
-  return normalized;
-}
-
-function currentRoutePlan(): RoutePlan | null {
-  const activePlan = activeDriverRoutePlan();
-  if (activePlan) {
-    return activePlan;
-  }
-
-  if (samePosition([props.pickupLng, props.pickupLat], [props.destinationLng, props.destinationLat])) {
-    return null;
-  }
-
-  return {
-    origin: [props.pickupLng, props.pickupLat],
-    destination: [props.destinationLng, props.destinationLat],
-    mode: "preview",
-    signature: `preview:${props.pickupLng.toFixed(5)},${props.pickupLat.toFixed(5)}:${props.destinationLng.toFixed(5)},${props.destinationLat.toFixed(5)}`,
-  };
-}
-
-function activeDriverRoutePlan(): RoutePlan | null {
-  const order = props.currentOrder;
-  if (!order || !order.driver_id) {
-    return null;
-  }
-
-  const driver = props.liveDriverLocations[order.driver_id];
-  if (!driver) {
-    return null;
-  }
-
-  switch (order.status) {
-    case "accepted":
-    case "driver_arrived":
-      return {
-        origin: [driver.lng, driver.lat],
-        destination: [props.pickupLng, props.pickupLat],
-        mode: "pickup",
-        signature: `pickup:${order.id}:${order.driver_id}:${props.pickupLng.toFixed(5)},${props.pickupLat.toFixed(5)}`,
-        driverPosition: [driver.lng, driver.lat],
-      };
-    case "in_trip":
-      return {
-        origin: [driver.lng, driver.lat],
-        destination: [props.destinationLng, props.destinationLat],
-        mode: "trip",
-        signature: `trip:${order.id}:${order.driver_id}:${props.destinationLng.toFixed(5)},${props.destinationLat.toFixed(5)}`,
-        driverPosition: [driver.lng, driver.lat],
-      };
-    default:
-      return null;
-  }
-}
-
-function setFallbackRoute(path: Array<[number, number]>) {
-  routeLine?.setPath?.(path);
-}
-
-function extractDrivingPath(result: any): Array<[number, number]> {
-  const steps = result?.routes?.[0]?.steps;
-  if (!Array.isArray(steps)) {
-    return [];
-  }
-
-  const path: Array<[number, number]> = [];
-  for (const step of steps) {
-    const points = step?.path;
-    if (!Array.isArray(points)) {
-      continue;
-    }
-    for (const point of points) {
-      const lng = point?.lng ?? point?.getLng?.();
-      const lat = point?.lat ?? point?.getLat?.();
-      if (typeof lng !== "number" || typeof lat !== "number") {
-        continue;
-      }
-
-      const next: [number, number] = [lng, lat];
-      const prev = path[path.length - 1];
-      if (!prev || !samePosition(prev, next)) {
-        path.push(next);
-      }
-    }
-  }
-  return path;
 }
 
 function badgeHTML(text: string, color: string) {

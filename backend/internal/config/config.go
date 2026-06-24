@@ -31,6 +31,9 @@ type Config struct {
 	RedisKeyPrefix         string
 	RedisLocationTTL       time.Duration
 	RedisDispatchTTL       time.Duration
+	RouteAMapWebKey        string
+	RouteOSRMBaseURL       string
+	RouteRequestTimeout    time.Duration
 	ShutdownTimeout        time.Duration
 }
 
@@ -60,6 +63,9 @@ func Load() Config {
 		RedisKeyPrefix:         getEnv("REDIS_KEY_PREFIX", "uber-test"),
 		RedisLocationTTL:       getEnvDuration("REDIS_LOCATION_TTL", 24*time.Hour),
 		RedisDispatchTTL:       getEnvDuration("REDIS_DISPATCH_TTL", 30*time.Minute),
+		RouteAMapWebKey:        getEnv("ROUTE_AMAP_WEB_KEY", ""),
+		RouteOSRMBaseURL:       getEnv("ROUTE_OSRM_BASE_URL", "http://router.project-osrm.org"),
+		RouteRequestTimeout:    getEnvDuration("ROUTE_REQUEST_TIMEOUT", 5*time.Second),
 		ShutdownTimeout:        getEnvDuration("SHUTDOWN_TIMEOUT", 10*time.Second),
 	}
 }

@@ -79,6 +79,20 @@ func (s *MultiStore) ListLatest(ctx context.Context) ([]model.DriverLocation, er
 	return items, nil
 }
 
+func (s *MultiStore) GetLatestByDriverID(ctx context.Context, driverID string) (model.DriverLocation, error) {
+	item, err := s.primary.GetLatestByDriverID(ctx, driverID)
+	if err == nil {
+		return item, nil
+	}
+	s.logger.Warn("primary latest-by-driver read failed, falling back to secondary", "driver_id", driverID, "error", err)
+
+	item, secondaryErr := s.secondary.GetLatestByDriverID(ctx, driverID)
+	if secondaryErr != nil {
+		return model.DriverLocation{}, fmt.Errorf("secondary latest-by-driver read: %w", secondaryErr)
+	}
+	return item, nil
+}
+
 func (s *MultiStore) FindNearby(ctx context.Context, query model.NearbyQuery) ([]model.NearbyDriver, error) {
 	items, err := s.primary.FindNearby(ctx, query)
 	if err == nil && len(items) > 0 {
