@@ -17,6 +17,7 @@ func TestServiceRegisterAndLogin(t *testing.T) {
 		Phone:    "13800000000",
 		Password: "secret123",
 		Role:     model.RoleDriver,
+		PlateNo:  "沪A12345",
 	})
 	if err != nil {
 		t.Fatalf("register user: %v", err)
@@ -42,5 +43,13 @@ func TestServiceRegisterAndLogin(t *testing.T) {
 	}
 	if principal.UserID != user.ID || principal.DriverID != user.DriverID {
 		t.Fatalf("unexpected principal: %+v", principal)
+	}
+
+	profile, err := service.GetDriverProfileByDriverID(context.Background(), user.DriverID)
+	if err != nil {
+		t.Fatalf("get driver profile: %v", err)
+	}
+	if profile.PlateNo != "沪A12345" {
+		t.Fatalf("expected plate_no to be stored, got %q", profile.PlateNo)
 	}
 }

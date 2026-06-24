@@ -1,8 +1,8 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 
 import LiveMap from "./components/LiveMap.vue";
-import type { DriverLiveLocation, DriverRoute, LoginResult, NearbyDriver, Order, SocketEvent, Trip, User } from "./types";
+import type { DriverLiveLocation, DriverRoute, LoginResult, NearbyDriver, Order, SocketEvent, User } from "./types";
 
 const storageKey = "passenger-lab-session";
 const estimatedFareBase = 10;
@@ -15,7 +15,6 @@ const loadingOrders = ref(false);
 const loadingNearby = ref(false);
 const savingOrder = ref(false);
 const locating = ref(false);
-const loadingTrip = ref(false);
 const socketState = ref<"idle" | "connecting" | "open" | "closed">("idle");
 const mapReady = ref(false);
 const mapPickMode = ref<"pickup" | "destination">("pickup");
@@ -24,7 +23,6 @@ const message = ref("欢迎来到乘客测试台。先登录一个乘客账号�
 const orders = ref<Order[]>([]);
 const nearbyDrivers = ref<NearbyDriver[]>([]);
 const selectedOrderId = ref("");
-const selectedTrip = ref<Trip | null>(null);
 const socketEvents = ref<Array<{ id: number; text: string }>>([]);
 const liveDriverLocations = ref<Record<string, DriverLiveLocation>>({});
 const liveRoutes = ref<Record<string, DriverRoute>>({});
@@ -245,10 +243,9 @@ onBeforeUnmount(() => {
 
 watch(selectedOrderId, async (next) => {
   if (!next) {
-    selectedTrip.value = null;
     return;
   }
-  await Promise.all([loadTrip(next), loadOrderRoute(next)]);
+  await loadOrderRoute(next);
 });
 
 watch(
@@ -421,19 +418,6 @@ async function updateSelectedOrder(status: "cancelled" | "paid") {
   }
 }
 
-async function loadTrip(orderId: string) {
-  if (!orderId || !isAuthenticated.value) return;
-  loadingTrip.value = true;
-  try {
-    const result = await api<{ item: Trip }>(`/api/v1/orders/${orderId}/trip`);
-    selectedTrip.value = result.item;
-  } catch {
-    selectedTrip.value = null;
-  } finally {
-    loadingTrip.value = false;
-  }
-}
-
 async function loadOrderRoute(orderId: string) {
   if (!orderId || !isAuthenticated.value) return;
   try {
@@ -483,7 +467,6 @@ function startDraftOrder() {
   }
   draftMode.value = true;
   selectedOrderId.value = "";
-  selectedTrip.value = null;
   scheduleLoadPreviewRoute(50);
   message.value = "已切换到新订单草稿，当前可以重新设置上车点和目的地。";
 }
@@ -680,7 +663,6 @@ function logout() {
   orders.value = [];
   nearbyDrivers.value = [];
   selectedOrderId.value = "";
-  selectedTrip.value = null;
   liveDriverLocations.value = {};
   liveRoutes.value = {};
   previewRoute.value = null;
@@ -988,6 +970,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
               <dd>{{ selectedOrder.driver_id || "等待派单" }}</dd>
             </div>
             <div>
+              <dt>车牌号</dt>
+              <dd>{{ selectedOrder.driver_plate_no || "等待分配车辆" }}</dd>
+            </div>
+            <div>
               <dt>预估价</dt>
               <dd>{{ formatMoney(selectedOrder.estimated_price) }}</dd>
             </div>
@@ -1001,22 +987,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
             </div>
           </dl>
 
-          <div class="trip-card">
-            <div class="panel-head mini">
-              <h3>行程</h3>
-              <button class="ghost" :disabled="loadingTrip" @click="loadTrip(selectedOrder.id)">
-                {{ loadingTrip ? "加载中..." : "刷新行程" }}
-              </button>
-            </div>
-            <template v-if="selectedTrip">
-              <p>状态：{{ selectedTrip.status }}</p>
-              <p>里程：{{ selectedTrip.actual_distance_m }} m</p>
-              <p>时长：{{ selectedTrip.actual_duration_s }} s</p>
-              <p>等待：{{ selectedTrip.waiting_duration_s }} s</p>
-              <p>费用：{{ formatMoney(selectedTrip.final_price || selectedTrip.estimated_price) }}</p>
-            </template>
-            <p v-else class="empty-hint">这单还没有行程数据，通常在司机接单后逐步生成。</p>
-          </div>
         </div>
         <p v-else class="empty-hint">左侧选中一条订单，这里会显示更完整的状态和费用信息。</p>
       </section>
@@ -1306,7 +1276,6 @@ input:focus {
 
 .message-box,
 .session-card,
-.trip-card,
 .detail-summary {
   padding: 16px;
   border-radius: 20px;

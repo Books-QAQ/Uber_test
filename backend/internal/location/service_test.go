@@ -24,6 +24,29 @@ func (b *stubBroadcaster) BroadcastJSON(v any) {
 	}
 }
 
+type stubMatcher struct {
+	latest map[string]model.DriverLocation
+}
+
+func (s *stubMatcher) Sync(_ context.Context, raw model.DriverLocation) (model.DriverLocation, error) {
+	if s.latest == nil {
+		s.latest = make(map[string]model.DriverLocation)
+	}
+	matched := raw
+	matched.Lat += 0.001
+	matched.Lng += 0.001
+	s.latest[raw.DriverID] = matched
+	return matched, nil
+}
+
+func (s *stubMatcher) GetLatest(driverID string) (model.DriverLocation, bool) {
+	if s.latest == nil {
+		return model.DriverLocation{}, false
+	}
+	item, ok := s.latest[driverID]
+	return item, ok
+}
+
 func TestServiceHandlePacketSupportsBatchAndHeartbeat(t *testing.T) {
 	t.Parallel()
 
@@ -149,6 +172,75 @@ func TestServiceFindNearbyReturnsOnlyOnlineDrivers(t *testing.T) {
 	}
 	if items[0].DriverID != "driver-online" {
 		t.Fatalf("expected driver-online, got %s", items[0].DriverID)
+	}
+}
+
+func TestServiceBroadcastsAndReadsMatchedLocations(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemoryStore(10)
+	broadcaster := &stubBroadcaster{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := NewService(store, broadcaster, logger)
+	service.SetLocationMatcher(&stubMatcher{})
+
+	now := time.Date(2026, 6, 24, 1, 0, 0, 0, time.UTC)
+	if err := service.SetDriverStatus(context.Background(), model.DriverStatus{
+		DriverID:  "driver-match",
+		Status:    model.DriverStatusOnline,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("set driver online: %v", err)
+	}
+
+	payload, err := proto.Marshal(&locationpb.LocationIngressPacket{
+		Payload: &locationpb.LocationIngressPacket_LocationUpdate{
+			LocationUpdate: &locationpb.DriverLocationUpdate{
+				DriverId:         "driver-match",
+				Lat:              31.2304,
+				Lng:              121.4737,
+				ReportedAtUnixMs: now.UnixMilli(),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal single payload: %v", err)
+	}
+
+	if err := service.HandlePacket(context.Background(), netip.MustParseAddrPort("127.0.0.1:9000"), payload); err != nil {
+		t.Fatalf("handle payload: %v", err)
+	}
+
+	latest, err := service.GetLatestByDriverID(context.Background(), "driver-match")
+	if err != nil {
+		t.Fatalf("get latest by driver: %v", err)
+	}
+	if latest.Lat <= 31.2304 || latest.Lng <= 121.4737 {
+		t.Fatalf("expected matched coordinates, got %+v", latest)
+	}
+
+	items, err := service.FindNearby(context.Background(), model.NearbyQuery{
+		Lat:     31.2304,
+		Lng:     121.4737,
+		RadiusM: 500,
+		Limit:   10,
+	})
+	if err != nil {
+		t.Fatalf("find nearby: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 nearby driver, got %d", len(items))
+	}
+	if items[0].Location.Lat <= 31.2304 || items[0].Location.Lng <= 121.4737 {
+		t.Fatalf("expected nearby response to expose matched coordinates, got %+v", items[0].Location)
+	}
+
+	data, ok := broadcaster.payloads[len(broadcaster.payloads)-1]["data"].(model.DriverLocation)
+	if !ok {
+		t.Fatalf("expected broadcast payload data to be model.DriverLocation")
+	}
+	if data.Lat <= 31.2304 || data.Lng <= 121.4737 {
+		t.Fatalf("expected broadcast to use matched coordinates, got %+v", data)
 	}
 }
 

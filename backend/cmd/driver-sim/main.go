@@ -35,11 +35,14 @@ type registerRequest struct {
 	Password    string `json:"password"`
 	Role        string `json:"role"`
 	DisplayName string `json:"display_name"`
+	PlateNo     string `json:"plate_no,omitempty"`
+	DeviceType  string `json:"device_type,omitempty"`
 }
 
 type loginRequest struct {
-	Phone    string `json:"phone"`
-	Password string `json:"password"`
+	Phone      string `json:"phone"`
+	Password   string `json:"password"`
+	DeviceType string `json:"device_type,omitempty"`
 }
 
 type loginResponse struct {
@@ -73,6 +76,7 @@ type driverAgent struct {
 	displayName   string
 	phone         string
 	password      string
+	plateNo       string
 	driverID      string
 	token         string
 	baseLat       float64
@@ -140,6 +144,7 @@ func main() {
 			displayName:   fmt.Sprintf("Sim Driver %d", i+1),
 			phone:         fmt.Sprintf("%s%04d", *phonePrefix, i+1),
 			password:      *password,
+			plateNo:       generatePlateNo(i + 1),
 			baseLat:       *centerLat,
 			baseLng:       *centerLng,
 			radiusMeters:  *radiusMeters,
@@ -161,7 +166,7 @@ func main() {
 		if err := agent.bootstrap(ctx); err != nil {
 			log.Fatalf("bootstrap %s failed: %v", agent.displayName, err)
 		}
-		log.Printf("%s ready phone=%s driver_id=%s", agent.displayName, agent.phone, agent.driverID)
+		log.Printf("%s ready phone=%s driver_id=%s plate_no=%s", agent.displayName, agent.phone, agent.driverID, agent.plateNo)
 	}
 
 	var wg sync.WaitGroup
@@ -183,6 +188,8 @@ func (a *driverAgent) bootstrap(ctx context.Context) error {
 		Password:    a.password,
 		Role:        model.RoleDriver,
 		DisplayName: a.displayName,
+		PlateNo:     a.plateNo,
+		DeviceType:  "sim",
 	}
 	status, body, err := a.doJSON(ctx, http.MethodPost, "/api/v1/auth/register", "", registerBody)
 	if err != nil {
@@ -194,8 +201,9 @@ func (a *driverAgent) bootstrap(ctx context.Context) error {
 
 	var loginResult loginResponse
 	if err := a.decodeJSON(ctx, http.MethodPost, "/api/v1/auth/login", "", loginRequest{
-		Phone:    a.phone,
-		Password: a.password,
+		Phone:      a.phone,
+		Password:   a.password,
+		DeviceType: "sim",
 	}, &loginResult); err != nil {
 		return err
 	}
@@ -204,6 +212,9 @@ func (a *driverAgent) bootstrap(ctx context.Context) error {
 	a.driverID = loginResult.Item.User.DriverID
 	if a.driverID == "" {
 		return errors.New("login result missing driver_id")
+	}
+	if err := a.upsertVehicle(ctx); err != nil {
+		return err
 	}
 
 	var onlineResult struct {
@@ -219,6 +230,19 @@ func (a *driverAgent) bootstrap(ctx context.Context) error {
 		return err
 	}
 
+	return nil
+}
+
+func (a *driverAgent) upsertVehicle(ctx context.Context) error {
+	status, body, err := a.doJSON(ctx, http.MethodPost, fmt.Sprintf("/api/v1/drivers/%s/vehicle", a.driverID), a.token, map[string]string{
+		"plate_no": a.plateNo,
+	})
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("upsert vehicle: status=%d body=%s", status, string(body))
+	}
 	return nil
 }
 
@@ -356,7 +380,7 @@ func (a *driverAgent) syncAndDriveOrder(ctx context.Context) error {
 	now := time.Now().UTC()
 	switch tracked.Order.Status {
 	case model.OrderStatusAccepted:
-		if a.distanceTo(tracked.Order.PickupLat, tracked.Order.PickupLng) <= a.arriveWithinM {
+		if a.canAdvanceAlongRoute(tracked.Order.PickupLat, tracked.Order.PickupLng, "pickup") {
 			return a.progressOrder(ctx, tracked.Order.ID, model.UpdateOrderStatusInput{Status: model.OrderStatusDriverArrived}, "arrived")
 		}
 	case model.OrderStatusDriverArrived:
@@ -364,7 +388,7 @@ func (a *driverAgent) syncAndDriveOrder(ctx context.Context) error {
 			return a.progressOrder(ctx, tracked.Order.ID, model.UpdateOrderStatusInput{Status: model.OrderStatusInTrip}, "started")
 		}
 	case model.OrderStatusInTrip:
-		if a.distanceTo(tracked.Order.DestinationLat, tracked.Order.DestinationLng) <= a.arriveWithinM {
+		if a.canAdvanceAlongRoute(tracked.Order.DestinationLat, tracked.Order.DestinationLng, "trip") {
 			return a.progressOrder(ctx, tracked.Order.ID, model.UpdateOrderStatusInput{
 				Status:           model.OrderStatusCompleted,
 				ActualDistanceM:  6200,
@@ -463,6 +487,9 @@ func (a *driverAgent) refreshRouteFromBackend(ctx context.Context, orderItem mod
 	}
 
 	a.mu.Lock()
+	if a.currentLat != 0 || a.currentLng != 0 {
+		nextPath = trimRouteFromPosition(nextPath, routePoint{Lat: a.currentLat, Lng: a.currentLng})
+	}
 	a.routeMode = result.Item.Mode
 	a.routeOrderID = orderItem.ID
 	a.routePath = nextPath
@@ -609,6 +636,32 @@ func (a *driverAgent) distanceTo(lat, lng float64) float64 {
 	return linearDistanceMeters(a.currentLat, a.currentLng, lat, lng)
 }
 
+func (a *driverAgent) canAdvanceAlongRoute(targetLat, targetLng float64, expectedMode string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	currentLat := a.currentLat
+	currentLng := a.currentLng
+	if currentLat == 0 && currentLng == 0 {
+		currentLat = a.baseLat
+		currentLng = a.baseLng
+	}
+
+	distance := linearDistanceMeters(currentLat, currentLng, targetLat, targetLng)
+	if distance <= a.arriveWithinM {
+		return true
+	}
+
+	// When the route has been fully consumed, allow a small snap-to-finish buffer
+	// to tolerate minor map-matching and routing drift, but avoid time-based jumps.
+	routeExhaustedNearTarget := a.routeMode == expectedMode &&
+		a.routeOrderID != "" &&
+		len(a.routePath) == 0 &&
+		distance <= math.Max(a.arriveWithinM*1.5, 60)
+
+	return routeExhaustedNearTarget
+}
+
 func (a *driverAgent) decodeJSON(ctx context.Context, method, path, token string, payload any, out any) error {
 	status, body, err := a.doJSON(ctx, method, path, token, payload)
 	if err != nil {
@@ -726,6 +779,84 @@ func followRoute(fromLat, fromLng float64, path *[]routePoint, stepM float64) (f
 	}
 
 	return currentLat, currentLng
+}
+
+func trimRouteFromPosition(path []routePoint, current routePoint) []routePoint {
+	normalized := dedupeRoutePoints(path)
+	if len(normalized) == 0 {
+		return nil
+	}
+	if len(normalized) == 1 {
+		if sameRoutePoint(current, normalized[0]) {
+			return normalized
+		}
+		return []routePoint{current, normalized[0]}
+	}
+
+	nearestSegmentIndex := 0
+	nearestProjection := normalized[0]
+	nearestDistance := math.MaxFloat64
+	for index := 0; index < len(normalized)-1; index++ {
+		projection := projectRoutePointToSegment(current, normalized[index], normalized[index+1])
+		if projection.distance < nearestDistance {
+			nearestDistance = projection.distance
+			nearestSegmentIndex = index
+			nearestProjection = projection.point
+		}
+	}
+
+	trimmed := []routePoint{current}
+	if !sameRoutePoint(trimmed[len(trimmed)-1], nearestProjection) {
+		trimmed = append(trimmed, nearestProjection)
+	}
+	for _, point := range normalized[nearestSegmentIndex+1:] {
+		if !sameRoutePoint(trimmed[len(trimmed)-1], point) {
+			trimmed = append(trimmed, point)
+		}
+	}
+	return dedupeRoutePoints(trimmed)
+}
+
+type projectedRoutePoint struct {
+	point    routePoint
+	distance float64
+}
+
+func projectRoutePointToSegment(point, start, end routePoint) projectedRoutePoint {
+	midLatRad := ((start.Lat + end.Lat + point.Lat) / 3) * math.Pi / 180
+	scaleX := 111320 * math.Cos(midLatRad)
+	scaleY := 111320.0
+
+	sx := start.Lng * scaleX
+	sy := start.Lat * scaleY
+	ex := end.Lng * scaleX
+	ey := end.Lat * scaleY
+	px := point.Lng * scaleX
+	py := point.Lat * scaleY
+
+	dx := ex - sx
+	dy := ey - sy
+	lengthSquared := dx*dx + dy*dy
+	if lengthSquared == 0 {
+		return projectedRoutePoint{
+			point:    start,
+			distance: linearDistanceMeters(point.Lat, point.Lng, start.Lat, start.Lng),
+		}
+	}
+
+	ratio := math.Max(0, math.Min(1, ((px-sx)*dx+(py-sy)*dy)/lengthSquared))
+	projected := routePoint{
+		Lat: start.Lat + (end.Lat-start.Lat)*ratio,
+		Lng: start.Lng + (end.Lng-start.Lng)*ratio,
+	}
+	return projectedRoutePoint{
+		point:    projected,
+		distance: linearDistanceMeters(point.Lat, point.Lng, projected.Lat, projected.Lng),
+	}
+}
+
+func sameRoutePoint(a, b routePoint) bool {
+	return math.Abs(a.Lat-b.Lat) < 0.000001 && math.Abs(a.Lng-b.Lng) < 0.000001
 }
 
 func fetchAMapDrivingRoute(client *http.Client, key string, originLat, originLng, destinationLat, destinationLng float64) ([]routePoint, error) {
@@ -995,4 +1126,8 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func generatePlateNo(index int) string {
+	return fmt.Sprintf("沪A%05d", index)
 }

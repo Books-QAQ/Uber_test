@@ -28,6 +28,7 @@ export type Order = {
   id: string;
   passenger_id: string;
   driver_id?: string;
+  driver_plate_no?: string;
   status: string;
   pickup_lat: number;
   pickup_lng: number;

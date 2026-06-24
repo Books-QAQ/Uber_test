@@ -84,6 +84,64 @@ func (s *MySQLStore) List(ctx context.Context) ([]model.Trip, error) {
 	return items, nil
 }
 
+func (s *MySQLStore) SavePoint(ctx context.Context, point model.TripPoint) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO trip_points (
+			id, trip_id, order_id, driver_id, trip_status, lat, lng, speed_kph, heading, accuracy_m, recorded_at, created_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, point.ID, point.TripID, point.OrderID, point.DriverID, point.TripStatus, point.Lat, point.Lng, point.SpeedKPH, point.Heading, point.AccuracyM, point.RecordedAt, point.CreatedAt)
+	return err
+}
+
+func (s *MySQLStore) ListPointsByTripID(ctx context.Context, tripID string) ([]model.TripPoint, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, trip_id, order_id, driver_id, trip_status, lat, lng, speed_kph, heading, accuracy_m, recorded_at, created_at
+		FROM trip_points
+		WHERE trip_id = ?
+		ORDER BY recorded_at ASC, created_at ASC
+	`, tripID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]model.TripPoint, 0)
+	for rows.Next() {
+		point, err := scanTripPoint(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, point)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(items) == 0 {
+		return nil, ErrNotFound
+	}
+	return items, nil
+}
+
+func (s *MySQLStore) GetLastPointByTripID(ctx context.Context, tripID string) (model.TripPoint, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, trip_id, order_id, driver_id, trip_status, lat, lng, speed_kph, heading, accuracy_m, recorded_at, created_at
+		FROM trip_points
+		WHERE trip_id = ?
+		ORDER BY recorded_at DESC, created_at DESC
+		LIMIT 1
+	`, tripID)
+
+	point, err := scanTripPoint(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.TripPoint{}, ErrNotFound
+		}
+		return model.TripPoint{}, err
+	}
+	return point, nil
+}
+
 type tripScanner interface {
 	Scan(dest ...any) error
 }
@@ -122,4 +180,27 @@ func nullableTime(value time.Time) sql.NullTime {
 		return sql.NullTime{}
 	}
 	return sql.NullTime{Time: value, Valid: true}
+}
+
+type tripPointScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanTripPoint(scanner tripPointScanner) (model.TripPoint, error) {
+	var point model.TripPoint
+	err := scanner.Scan(
+		&point.ID,
+		&point.TripID,
+		&point.OrderID,
+		&point.DriverID,
+		&point.TripStatus,
+		&point.Lat,
+		&point.Lng,
+		&point.SpeedKPH,
+		&point.Heading,
+		&point.AccuracyM,
+		&point.RecordedAt,
+		&point.CreatedAt,
+	)
+	return point, err
 }

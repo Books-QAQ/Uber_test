@@ -22,11 +22,22 @@ type RouteCoordinator interface {
 	ClearByDriverID(ctx context.Context, driverID string) error
 }
 
+type TripRecorder interface {
+	RecordLocation(ctx context.Context, location model.DriverLocation) error
+}
+
+type LocationMatcher interface {
+	Sync(ctx context.Context, raw model.DriverLocation) (model.DriverLocation, error)
+	GetLatest(driverID string) (model.DriverLocation, bool)
+}
+
 type Service struct {
-	store       Store
-	routeSync   RouteCoordinator
-	broadcaster Broadcaster
-	logger      *slog.Logger
+	store        Store
+	routeSync    RouteCoordinator
+	tripRecorder TripRecorder
+	matcher      LocationMatcher
+	broadcaster  Broadcaster
+	logger       *slog.Logger
 }
 
 func NewService(store Store, broadcaster Broadcaster, logger *slog.Logger) *Service {
@@ -42,6 +53,14 @@ func NewService(store Store, broadcaster Broadcaster, logger *slog.Logger) *Serv
 
 func (s *Service) SetRouteCoordinator(routeSync RouteCoordinator) {
 	s.routeSync = routeSync
+}
+
+func (s *Service) SetTripRecorder(tripRecorder TripRecorder) {
+	s.tripRecorder = tripRecorder
+}
+
+func (s *Service) SetLocationMatcher(matcher LocationMatcher) {
+	s.matcher = matcher
 }
 
 func (s *Service) HandlePacket(ctx context.Context, remoteAddr netip.AddrPort, payload []byte) error {
@@ -74,9 +93,15 @@ func (s *Service) HandlePacket(ctx context.Context, remoteAddr netip.AddrPort, p
 					s.logger.Warn("sync route for driver location failed", "driver_id", message.Locations[0].DriverID, "error", err)
 				}
 			}
+			if s.tripRecorder != nil {
+				if err := s.tripRecorder.RecordLocation(ctx, message.Locations[0]); err != nil {
+					s.logger.Warn("record trip point failed", "driver_id", message.Locations[0].DriverID, "order_id", message.Locations[0].OrderID, "error", err)
+				}
+			}
+			broadcastLocation := s.visibleLocation(ctx, message.Locations[0])
 			s.broadcaster.BroadcastJSON(map[string]any{
 				"type": "driver.location.updated",
-				"data": message.Locations[0],
+				"data": broadcastLocation,
 			})
 			s.logger.Debug("processed location update packet", "driver_id", message.Locations[0].DriverID, "remote_addr", remoteAddr.String())
 			return nil
@@ -92,10 +117,21 @@ func (s *Service) HandlePacket(ctx context.Context, remoteAddr netip.AddrPort, p
 				}
 			}
 		}
+		if s.tripRecorder != nil {
+			for _, location := range message.Locations {
+				if err := s.tripRecorder.RecordLocation(ctx, location); err != nil {
+					s.logger.Warn("record batch trip point failed", "driver_id", location.DriverID, "order_id", location.OrderID, "error", err)
+				}
+			}
+		}
+		visibleBatch := make([]model.DriverLocation, 0, len(message.Locations))
+		for _, location := range message.Locations {
+			visibleBatch = append(visibleBatch, s.visibleLocation(ctx, location))
+		}
 		s.broadcaster.BroadcastJSON(map[string]any{
 			"type":  "driver.location.batch.updated",
 			"count": len(message.Locations),
-			"data":  message.Locations,
+			"data":  visibleBatch,
 		})
 		s.logger.Debug("processed location batch packet", "count", len(message.Locations), "remote_addr", remoteAddr.String())
 		return nil
@@ -120,14 +156,30 @@ func (s *Service) HandlePacket(ctx context.Context, remoteAddr netip.AddrPort, p
 }
 
 func (s *Service) ListLatest(ctx context.Context) ([]model.DriverLocation, error) {
-	return s.store.ListLatest(ctx)
+	items, err := s.store.ListLatest(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if s.matcher == nil {
+		return items, nil
+	}
+
+	visible := make([]model.DriverLocation, 0, len(items))
+	for _, item := range items {
+		visible = append(visible, s.overlayMatched(item))
+	}
+	return visible, nil
 }
 
 func (s *Service) GetLatestByDriverID(ctx context.Context, driverID string) (model.DriverLocation, error) {
 	if driverID == "" {
 		return model.DriverLocation{}, fmt.Errorf("get latest driver location: missing driver_id")
 	}
-	return s.store.GetLatestByDriverID(ctx, driverID)
+	item, err := s.store.GetLatestByDriverID(ctx, driverID)
+	if err != nil {
+		return model.DriverLocation{}, err
+	}
+	return s.overlayMatched(item), nil
 }
 
 func (s *Service) SetDriverStatus(ctx context.Context, status model.DriverStatus) error {
@@ -153,7 +205,20 @@ func (s *Service) FindNearby(ctx context.Context, query model.NearbyQuery) ([]mo
 	}
 	query.OnlyLive = true
 
-	return s.store.FindNearby(ctx, query)
+	items, err := s.store.FindNearby(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	if s.matcher == nil {
+		return items, nil
+	}
+
+	visible := make([]model.NearbyDriver, 0, len(items))
+	for _, item := range items {
+		item.Location = s.overlayMatched(item.Location)
+		visible = append(visible, item)
+	}
+	return visible, nil
 }
 
 func (s *Service) ExpireInactiveDrivers(ctx context.Context, cutoff time.Time) ([]model.DriverStatus, error) {
@@ -194,6 +259,29 @@ func (s *Service) RunExpirationLoop(ctx context.Context, interval, inactiveTimeo
 			}
 		}
 	}
+}
+
+func (s *Service) visibleLocation(ctx context.Context, raw model.DriverLocation) model.DriverLocation {
+	if s.matcher == nil {
+		return raw
+	}
+
+	matched, err := s.matcher.Sync(ctx, raw)
+	if err != nil {
+		s.logger.Warn("map match failed, falling back to raw location", "driver_id", raw.DriverID, "order_id", raw.OrderID, "error", err)
+		return raw
+	}
+	return matched
+}
+
+func (s *Service) overlayMatched(raw model.DriverLocation) model.DriverLocation {
+	if s.matcher == nil {
+		return raw
+	}
+	if matched, ok := s.matcher.GetLatest(raw.DriverID); ok {
+		return matched
+	}
+	return raw
 }
 
 type decodedIngress struct {

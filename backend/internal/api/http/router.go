@@ -37,10 +37,10 @@ func NewRouter(deps RouterDeps) http.Handler {
 	healthHandler := handlers.NewHealthHandler()
 	authHandler := handlers.NewAuthHandler(deps.AuthService)
 	locationHandler := handlers.NewLocationHandler(deps.LocationService)
-	driverHandler := handlers.NewDriverHandler(deps.LocationService)
+	driverHandler := handlers.NewDriverHandler(deps.LocationService, deps.AuthService)
 	routeHandler := handlers.NewRouteHandler(deps.RouteService)
 	tripHandler := handlers.NewTripHandler(deps.TripService)
-	orderHandler := handlers.NewOrderHandler(deps.OrderService, tripHandler, routeHandler)
+	orderHandler := handlers.NewOrderHandler(deps.OrderService, tripHandler, routeHandler, deps.AuthService)
 	dispatchHandler := handlers.NewDispatchHandler(deps.DispatchService)
 	requireAuth := deps.Authenticator.RequireAuth
 
@@ -86,6 +86,8 @@ func routeDriverSubresources(driverHandler *handlers.DriverHandler, orderHandler
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/status"):
 			driverHandler.SetStatus(w, r)
+		case strings.HasSuffix(r.URL.Path, "/vehicle"):
+			driverHandler.SetVehicle(w, r)
 		case strings.HasSuffix(r.URL.Path, "/current-order"):
 			orderHandler.GetCurrentByDriver(w, r)
 		case strings.HasSuffix(r.URL.Path, "/dispatches"):

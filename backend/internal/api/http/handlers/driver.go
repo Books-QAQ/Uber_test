@@ -8,20 +8,29 @@ import (
 	"time"
 
 	"uber-test/backend/internal/api/http/middleware"
+	"uber-test/backend/internal/auth"
 	"uber-test/backend/internal/location"
 	"uber-test/backend/internal/model"
 )
 
 type DriverHandler struct {
 	locationService *location.Service
+	authService     *auth.Service
 }
 
 type setDriverStatusRequest struct {
 	Status string `json:"status"`
 }
 
-func NewDriverHandler(locationService *location.Service) *DriverHandler {
-	return &DriverHandler{locationService: locationService}
+type setDriverVehicleRequest struct {
+	PlateNo string `json:"plate_no"`
+}
+
+func NewDriverHandler(locationService *location.Service, authService *auth.Service) *DriverHandler {
+	return &DriverHandler{
+		locationService: locationService,
+		authService:     authService,
+	}
 }
 
 func (h *DriverHandler) SetStatus(w http.ResponseWriter, r *http.Request) {
@@ -69,6 +78,60 @@ func (h *DriverHandler) SetStatus(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"item": status,
+	})
+}
+
+func (h *DriverHandler) SetVehicle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{
+			"error": "method not allowed",
+		})
+		return
+	}
+	if h.authService == nil {
+		writeJSON(w, http.StatusNotImplemented, map[string]any{
+			"error": "auth service unavailable",
+		})
+		return
+	}
+
+	driverID, ok := lastPathParam(r.URL.Path, "/api/v1/drivers/", "/vehicle")
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "invalid driver vehicle path",
+		})
+		return
+	}
+	if err := middleware.MustBeSelfOrAdmin(r, driverID); err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]any{
+			"error": err.Error(),
+		})
+		return
+	}
+
+	var req setDriverVehicleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "invalid json body",
+		})
+		return
+	}
+	if err := h.authService.UpsertDriverVehicle(r.Context(), driverID, req.PlateNo); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": err.Error(),
+		})
+		return
+	}
+
+	profile, err := h.authService.GetDriverProfileByDriverID(r.Context(), driverID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error": err.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"item": profile,
 	})
 }
 

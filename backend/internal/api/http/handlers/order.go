@@ -17,13 +17,15 @@ type OrderHandler struct {
 	orderService *order.Service
 	tripHandler  *TripHandler
 	routeHandler *RouteHandler
+	authService  *auth.Service
 }
 
-func NewOrderHandler(orderService *order.Service, tripHandler *TripHandler, routeHandler *RouteHandler) *OrderHandler {
+func NewOrderHandler(orderService *order.Service, tripHandler *TripHandler, routeHandler *RouteHandler, authService *auth.Service) *OrderHandler {
 	return &OrderHandler{
 		orderService: orderService,
 		tripHandler:  tripHandler,
 		routeHandler: routeHandler,
+		authService:  authService,
 	}
 }
 
@@ -63,7 +65,7 @@ func (h *OrderHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, map[string]any{"item": item})
+	writeJSON(w, http.StatusCreated, map[string]any{"item": h.enrichOrder(r, item)})
 }
 
 func (h *OrderHandler) List(w http.ResponseWriter, r *http.Request) {
@@ -95,7 +97,7 @@ func (h *OrderHandler) List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	writeJSON(w, http.StatusOK, map[string]any{"items": h.enrichOrders(r, items)})
 }
 
 func (h *OrderHandler) GetOrUpdateStatus(w http.ResponseWriter, r *http.Request) {
@@ -148,7 +150,7 @@ func (h *OrderHandler) GetCurrentByDriver(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"item": item})
+	writeJSON(w, http.StatusOK, map[string]any{"item": h.enrichOrder(r, item)})
 }
 
 func (h *OrderHandler) getByID(w http.ResponseWriter, r *http.Request, orderID string) {
@@ -175,7 +177,7 @@ func (h *OrderHandler) getByID(w http.ResponseWriter, r *http.Request, orderID s
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"item": item})
+	writeJSON(w, http.StatusOK, map[string]any{"item": h.enrichOrder(r, item)})
 }
 
 func (h *OrderHandler) updateStatus(w http.ResponseWriter, r *http.Request, orderID string) {
@@ -226,7 +228,7 @@ func (h *OrderHandler) updateStatus(w http.ResponseWriter, r *http.Request, orde
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"item": item})
+	writeJSON(w, http.StatusOK, map[string]any{"item": h.enrichOrder(r, item)})
 }
 
 func (h *OrderHandler) getTrip(w http.ResponseWriter, r *http.Request, orderID string) {
@@ -343,4 +345,30 @@ func authorizeOrderStatusUpdate(r *http.Request, orderItem model.Order, req mode
 	default:
 		return auth.ErrForbidden
 	}
+}
+
+func (h *OrderHandler) enrichOrders(r *http.Request, items []model.Order) []model.Order {
+	if len(items) == 0 {
+		return items
+	}
+
+	enriched := make([]model.Order, 0, len(items))
+	for _, item := range items {
+		enriched = append(enriched, h.enrichOrder(r, item))
+	}
+	return enriched
+}
+
+func (h *OrderHandler) enrichOrder(r *http.Request, item model.Order) model.Order {
+	if h.authService == nil || item.DriverID == "" {
+		return item
+	}
+
+	profile, err := h.authService.GetDriverProfileByDriverID(r.Context(), item.DriverID)
+	if err != nil {
+		return item
+	}
+
+	item.DriverPlateNo = profile.PlateNo
+	return item
 }

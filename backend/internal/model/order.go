@@ -18,6 +18,7 @@ type Order struct {
 	ID                 string    `json:"id"`
 	PassengerID        string    `json:"passenger_id"`
 	DriverID           string    `json:"driver_id,omitempty"`
+	DriverPlateNo      string    `json:"driver_plate_no,omitempty"`
 	Status             string    `json:"status"`
 	PickupLat          float64   `json:"pickup_lat"`
 	PickupLng          float64   `json:"pickup_lng"`

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"time"
 
 	"uber-test/backend/internal/model"
@@ -74,11 +75,84 @@ func (s *Service) GetByOrderID(ctx context.Context, orderID string) (model.Trip,
 	if orderID == "" {
 		return model.Trip{}, fmt.Errorf("get trip: missing order_id")
 	}
-	return s.store.GetByOrderID(ctx, orderID)
+	trip, err := s.store.GetByOrderID(ctx, orderID)
+	if err != nil {
+		return model.Trip{}, err
+	}
+	points, err := s.store.ListPointsByTripID(ctx, trip.ID)
+	if err == nil {
+		trip.Points = points
+	} else if err != ErrNotFound {
+		return model.Trip{}, err
+	}
+	return trip, nil
 }
 
 func (s *Service) List(ctx context.Context) ([]model.Trip, error) {
 	return s.store.List(ctx)
+}
+
+func (s *Service) RecordLocation(ctx context.Context, location model.DriverLocation) error {
+	if location.OrderID == "" {
+		return nil
+	}
+
+	trip, err := s.store.GetByOrderID(ctx, location.OrderID)
+	if err != nil {
+		if err == ErrNotFound {
+			return nil
+		}
+		return err
+	}
+	if trip.Status != model.TripStatusPending && trip.Status != model.TripStatusInTrip {
+		return nil
+	}
+
+	recordedAt := location.Timestamp
+	if recordedAt.IsZero() {
+		recordedAt = time.Now().UTC()
+	}
+	now := time.Now().UTC()
+	point := model.TripPoint{
+		ID:         newTripPointID(),
+		TripID:     trip.ID,
+		OrderID:    trip.OrderID,
+		DriverID:   location.DriverID,
+		TripStatus: trip.Status,
+		Lat:        location.Lat,
+		Lng:        location.Lng,
+		SpeedKPH:   location.SpeedKPH,
+		Heading:    location.Heading,
+		AccuracyM:  location.AccuracyM,
+		RecordedAt: recordedAt,
+		CreatedAt:  now,
+	}
+
+	lastPoint, err := s.store.GetLastPointByTripID(ctx, trip.ID)
+	hasLastPoint := err == nil
+	if err != nil && err != ErrNotFound {
+		return err
+	}
+	if hasLastPoint && isDuplicateTripPoint(lastPoint, point) {
+		return nil
+	}
+
+	if err := s.store.SavePoint(ctx, point); err != nil {
+		return err
+	}
+
+	if trip.Status != model.TripStatusInTrip {
+		return nil
+	}
+
+	if hasLastPoint && lastPoint.TripStatus == model.TripStatusInTrip {
+		trip.ActualDistanceM += int(math.Round(haversineMeters(lastPoint.Lat, lastPoint.Lng, point.Lat, point.Lng)))
+	}
+	if !trip.StartedAt.IsZero() {
+		trip.ActualDurationS = maxInt(trip.ActualDurationS, int(recordedAt.Sub(trip.StartedAt).Seconds()))
+	}
+	trip.UpdatedAt = now
+	return s.store.Save(ctx, trip)
 }
 
 func calculateFare(order model.Order, input model.UpdateOrderStatusInput, trip model.Trip) float64 {
@@ -115,6 +189,14 @@ func newTripID() string {
 	return "trip-" + hex.EncodeToString(buf[:])
 }
 
+func newTripPointID() string {
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return fmt.Sprintf("trip-point-%d", time.Now().UnixNano())
+	}
+	return "trip-point-" + hex.EncodeToString(buf[:])
+}
+
 func maxInt(a, b int) int {
 	if a > b {
 		return a
@@ -124,4 +206,30 @@ func maxInt(a, b int) int {
 
 func roundTo2(value float64) float64 {
 	return float64(int(value*100+0.5)) / 100
+}
+
+func isDuplicateTripPoint(a, b model.TripPoint) bool {
+	if a.TripStatus != b.TripStatus {
+		return false
+	}
+	if math.Abs(a.Lat-b.Lat) > 0.000001 || math.Abs(a.Lng-b.Lng) > 0.000001 {
+		return false
+	}
+	return a.RecordedAt.Equal(b.RecordedAt)
+}
+
+func haversineMeters(lat1, lng1, lat2, lng2 float64) float64 {
+	const earthRadiusM = 6371000.0
+
+	lat1Rad := lat1 * math.Pi / 180
+	lat2Rad := lat2 * math.Pi / 180
+	deltaLat := (lat2 - lat1) * math.Pi / 180
+	deltaLng := (lng2 - lng1) * math.Pi / 180
+
+	a := math.Sin(deltaLat/2)*math.Sin(deltaLat/2) +
+		math.Cos(lat1Rad)*math.Cos(lat2Rad)*
+			math.Sin(deltaLng/2)*math.Sin(deltaLng/2)
+	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+
+	return earthRadiusM * c
 }

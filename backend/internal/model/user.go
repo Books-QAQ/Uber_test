@@ -24,11 +24,14 @@ type RegisterInput struct {
 	Password    string `json:"password"`
 	Role        string `json:"role"`
 	DisplayName string `json:"display_name"`
+	PlateNo     string `json:"plate_no,omitempty"`
+	DeviceType  string `json:"device_type,omitempty"`
 }
 
 type LoginInput struct {
-	Phone    string `json:"phone"`
-	Password string `json:"password"`
+	Phone      string `json:"phone"`
+	Password   string `json:"password"`
+	DeviceType string `json:"device_type,omitempty"`
 }
 
 func IsValidRole(role string) bool {

@@ -16,6 +16,7 @@ import (
 	"uber-test/backend/internal/config"
 	"uber-test/backend/internal/dispatch"
 	"uber-test/backend/internal/location"
+	"uber-test/backend/internal/mapmatch"
 	"uber-test/backend/internal/order"
 	"uber-test/backend/internal/routeplan"
 	mysqlstorage "uber-test/backend/internal/storage/mysql"
@@ -101,6 +102,21 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		logger.Info("redis-backed location/dispatch stores enabled", "addr", cfg.RedisAddr, "db", cfg.RedisDB, "key_prefix", cfg.RedisKeyPrefix)
 	}
 	locationService := location.NewService(locationStore, hub, logger)
+	if cfg.MapMatchEnabled && cfg.RouteOSRMBaseURL != "" {
+		locationMatcher := mapmatch.NewService(
+			locationStore,
+			mapmatch.NewOSRMMatcher(mapmatch.MatcherConfig{
+				OSRMBaseURL:    cfg.RouteOSRMBaseURL,
+				RequestTimeout: cfg.RouteRequestTimeout,
+			}),
+			logger,
+			cfg.MapMatchMinPoints,
+			cfg.MapMatchWindowSize,
+			cfg.MapMatchMaxLookback,
+		)
+		locationService.SetLocationMatcher(locationMatcher)
+		logger.Info("osrm map match enabled", "osrm_base_url", cfg.RouteOSRMBaseURL, "min_points", cfg.MapMatchMinPoints, "window_size", cfg.MapMatchWindowSize, "max_lookback", cfg.MapMatchMaxLookback)
+	}
 	tripService := trip.NewService(tripStore)
 	routePlanner := routeplan.NewHTTPPlanner(routeplan.PlannerConfig{
 		AMapWebKey:     cfg.RouteAMapWebKey,
@@ -111,6 +127,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	dispatchService := dispatch.NewService(dispatchStore, orderStore, locationService, hub, logger)
 	orderService := order.NewService(orderStore, locationService, tripService, dispatchService)
 	locationService.SetRouteCoordinator(routeService)
+	locationService.SetTripRecorder(tripService)
 	orderService.SetRouteCoordinator(routeService)
 
 	router := httpapi.NewRouter(httpapi.RouterDeps{

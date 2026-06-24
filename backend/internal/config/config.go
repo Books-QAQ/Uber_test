@@ -34,6 +34,10 @@ type Config struct {
 	RouteAMapWebKey        string
 	RouteOSRMBaseURL       string
 	RouteRequestTimeout    time.Duration
+	MapMatchEnabled        bool
+	MapMatchMinPoints      int
+	MapMatchWindowSize     int
+	MapMatchMaxLookback    time.Duration
 	ShutdownTimeout        time.Duration
 }
 
@@ -66,6 +70,10 @@ func Load() Config {
 		RouteAMapWebKey:        getEnv("ROUTE_AMAP_WEB_KEY", ""),
 		RouteOSRMBaseURL:       getEnv("ROUTE_OSRM_BASE_URL", "http://router.project-osrm.org"),
 		RouteRequestTimeout:    getEnvDuration("ROUTE_REQUEST_TIMEOUT", 5*time.Second),
+		MapMatchEnabled:        getEnvBool("MAPMATCH_ENABLED", true),
+		MapMatchMinPoints:      getEnvInt("MAPMATCH_MIN_POINTS", 4),
+		MapMatchWindowSize:     getEnvInt("MAPMATCH_WINDOW_SIZE", 8),
+		MapMatchMaxLookback:    getEnvDuration("MAPMATCH_MAX_LOOKBACK", 45*time.Second),
 		ShutdownTimeout:        getEnvDuration("SHUTDOWN_TIMEOUT", 10*time.Second),
 	}
 }

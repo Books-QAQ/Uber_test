@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"embed"
 	"fmt"
+	"path/filepath"
+	"sort"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -47,13 +49,28 @@ func Open(ctx context.Context, cfg Config) (*sql.DB, error) {
 }
 
 func Migrate(ctx context.Context, db *sql.DB) error {
-	sqlBytes, err := migrationFS.ReadFile("migrations/001_init.sql")
+	entries, err := migrationFS.ReadDir("migrations")
 	if err != nil {
-		return fmt.Errorf("read mysql migration: %w", err)
+		return fmt.Errorf("read mysql migrations: %w", err)
 	}
 
-	if _, err := db.ExecContext(ctx, string(sqlBytes)); err != nil {
-		return fmt.Errorf("run mysql migration: %w", err)
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		names = append(names, entry.Name())
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		sqlBytes, readErr := migrationFS.ReadFile(filepath.ToSlash(filepath.Join("migrations", name)))
+		if readErr != nil {
+			return fmt.Errorf("read mysql migration %s: %w", name, readErr)
+		}
+		if _, execErr := db.ExecContext(ctx, string(sqlBytes)); execErr != nil {
+			return fmt.Errorf("run mysql migration %s: %w", name, execErr)
+		}
 	}
 
 	return nil
