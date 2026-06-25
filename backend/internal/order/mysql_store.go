@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"time"
 
 	"uber-test/backend/internal/model"
 )
@@ -92,6 +93,36 @@ func (s *MySQLStore) FindActiveByDriverID(ctx context.Context, driverID string) 
 		return model.Order{}, err
 	}
 	return order, nil
+}
+
+func (s *MySQLStore) Accept(ctx context.Context, id, driverID string, updatedAt time.Time) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE orders
+		SET driver_id = ?, status = ?, updated_at = ?
+		WHERE id = ?
+		  AND status = ?
+		  AND (driver_id IS NULL OR driver_id = '')
+	`, driverID, model.OrderStatusAccepted, updatedAt, id, model.OrderStatusPendingDispatch)
+	if err != nil {
+		return err
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows > 0 {
+		return nil
+	}
+
+	order, err := s.GetByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if order.Status != model.OrderStatusPendingDispatch || (order.DriverID != "" && order.DriverID != driverID) {
+		return ErrOrderAlreadyAccepted
+	}
+	return ErrNotFound
 }
 
 func (s *MySQLStore) Update(ctx context.Context, order model.Order) error {

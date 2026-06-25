@@ -151,6 +151,32 @@ func (s *Service) UpdateStatus(ctx context.Context, id string, input model.Updat
 		return model.Order{}, fmt.Errorf("invalid order status transition: %s -> %s", order.Status, input.Status)
 	}
 
+	if input.Status == model.OrderStatusAccepted {
+		driverID := input.DriverID
+		if driverID == "" {
+			driverID = order.DriverID
+		}
+
+		order.Status = model.OrderStatusAccepted
+		order.DriverID = driverID
+		order.UpdatedAt = time.Now().UTC()
+
+		if err := s.store.Accept(ctx, order.ID, driverID, order.UpdatedAt); err != nil {
+			return model.Order{}, err
+		}
+		if err := s.syncDispatch(ctx, order, input.Status); err != nil {
+			return model.Order{}, err
+		}
+		if err := s.syncDriverStatus(ctx, order, input.Status); err != nil {
+			return model.Order{}, err
+		}
+		if err := s.syncRoute(ctx, order); err != nil {
+			return model.Order{}, err
+		}
+
+		return order, nil
+	}
+
 	order.Status = input.Status
 	if input.DriverID != "" {
 		order.DriverID = input.DriverID

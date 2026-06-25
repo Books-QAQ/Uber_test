@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"time"
 
 	"uber-test/backend/internal/model"
 )
@@ -16,6 +17,7 @@ type Store interface {
 	ListByPassengerID(ctx context.Context, passengerID string) ([]model.Order, error)
 	ListByDriverID(ctx context.Context, driverID string) ([]model.Order, error)
 	FindActiveByDriverID(ctx context.Context, driverID string) (model.Order, error)
+	Accept(ctx context.Context, id, driverID string, updatedAt time.Time) error
 	Update(ctx context.Context, order model.Order) error
 }
 
@@ -109,6 +111,28 @@ func (s *MemoryStore) FindActiveByDriverID(_ context.Context, driverID string) (
 	}
 
 	return model.Order{}, ErrNotFound
+}
+
+func (s *MemoryStore) Accept(_ context.Context, id, driverID string, updatedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	order, exists := s.orders[id]
+	if !exists {
+		return ErrNotFound
+	}
+	if order.Status != model.OrderStatusPendingDispatch {
+		return ErrOrderAlreadyAccepted
+	}
+	if order.DriverID != "" && order.DriverID != driverID {
+		return ErrOrderAlreadyAccepted
+	}
+
+	order.DriverID = driverID
+	order.Status = model.OrderStatusAccepted
+	order.UpdatedAt = updatedAt
+	s.orders[id] = order
+	return nil
 }
 
 func (s *MemoryStore) Update(_ context.Context, order model.Order) error {

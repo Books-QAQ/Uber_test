@@ -132,6 +132,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 
 	router := httpapi.NewRouter(httpapi.RouterDeps{
 		Logger:          logger,
+		AccessLogEnabled: cfg.HTTPAccessLogEnabled,
 		AuthService:     authService,
 		Authenticator:   authenticator,
 		LocationService: locationService,

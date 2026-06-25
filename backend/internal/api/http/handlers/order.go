@@ -20,6 +20,27 @@ type OrderHandler struct {
 	authService  *auth.Service
 }
 
+type createOrderRequest struct {
+	PassengerID        string  `json:"passenger_id"`
+	PickupLat          float64 `json:"pickup_lat"`
+	PickupLng          float64 `json:"pickup_lng"`
+	PickupAddress      string  `json:"pickup_address"`
+	DestinationLat     float64 `json:"destination_lat"`
+	DestinationLng     float64 `json:"destination_lng"`
+	DestinationAddress string  `json:"destination_address"`
+	EstimatedPrice     float64 `json:"estimated_price"`
+	Pickup             *struct {
+		Latitude  float64 `json:"latitude"`
+		Longitude float64 `json:"longitude"`
+		Address   string  `json:"address"`
+	} `json:"pickup"`
+	Destination *struct {
+		Latitude  float64 `json:"latitude"`
+		Longitude float64 `json:"longitude"`
+		Address   string  `json:"address"`
+	} `json:"destination"`
+}
+
 func NewOrderHandler(orderService *order.Service, tripHandler *TripHandler, routeHandler *RouteHandler, authService *auth.Service) *OrderHandler {
 	return &OrderHandler{
 		orderService: orderService,
@@ -35,11 +56,12 @@ func (h *OrderHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req model.CreateOrderInput
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	var rawReq createOrderRequest
+	if err := json.NewDecoder(r.Body).Decode(&rawReq); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid json body"})
 		return
 	}
+	req := normalizeCreateOrderInput(rawReq)
 
 	principal, err := middleware.CurrentPrincipal(r)
 	if err != nil {
@@ -66,6 +88,45 @@ func (h *OrderHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, map[string]any{"item": h.enrichOrder(r, item)})
+}
+
+func normalizeCreateOrderInput(raw createOrderRequest) model.CreateOrderInput {
+	input := model.CreateOrderInput{
+		PassengerID:        raw.PassengerID,
+		PickupLat:          raw.PickupLat,
+		PickupLng:          raw.PickupLng,
+		PickupAddress:      raw.PickupAddress,
+		DestinationLat:     raw.DestinationLat,
+		DestinationLng:     raw.DestinationLng,
+		DestinationAddress: raw.DestinationAddress,
+		EstimatedPrice:     raw.EstimatedPrice,
+	}
+
+	if raw.Pickup != nil {
+		if input.PickupLat == 0 {
+			input.PickupLat = raw.Pickup.Latitude
+		}
+		if input.PickupLng == 0 {
+			input.PickupLng = raw.Pickup.Longitude
+		}
+		if input.PickupAddress == "" {
+			input.PickupAddress = raw.Pickup.Address
+		}
+	}
+
+	if raw.Destination != nil {
+		if input.DestinationLat == 0 {
+			input.DestinationLat = raw.Destination.Latitude
+		}
+		if input.DestinationLng == 0 {
+			input.DestinationLng = raw.Destination.Longitude
+		}
+		if input.DestinationAddress == "" {
+			input.DestinationAddress = raw.Destination.Address
+		}
+	}
+
+	return input
 }
 
 func (h *OrderHandler) List(w http.ResponseWriter, r *http.Request) {
@@ -217,6 +278,10 @@ func (h *OrderHandler) updateStatus(w http.ResponseWriter, r *http.Request, orde
 			return
 		}
 		if errors.Is(err, order.ErrDriverBusy) {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, order.ErrOrderAlreadyAccepted) {
 			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})
 			return
 		}

@@ -4,5 +4,7 @@
 .env.*
 backend/.tmp/
 backend/.tools/
+backend/runtime-bin/
+backend/runtime-logs/
 node_modules/
 dist/

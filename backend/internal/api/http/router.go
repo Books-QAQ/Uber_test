@@ -19,6 +19,7 @@ import (
 
 type RouterDeps struct {
 	Logger          *slog.Logger
+	AccessLogEnabled bool
 	AuthService     *auth.Service
 	Authenticator   *middleware.Authenticator
 	LocationService *location.Service
@@ -63,7 +64,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 	mux.Handle("/api/v1/trips", requireAuth(middleware.RequireRoles(model.RoleAdmin)(http.HandlerFunc(tripHandler.List))))
 	mux.Handle("/ws/location", requireAuth(wsapi.NewHandler(deps.Hub, deps.WSReadBuffer, deps.WSWriteBuffer)))
 
-	return withLogging(deps.Logger, mux)
+	return withLogging(deps.Logger, deps.AccessLogEnabled, mux)
 }
 
 func routeOrderCollection(handler *handlers.OrderHandler) http.HandlerFunc {
@@ -102,7 +103,10 @@ func routeDriverSubresources(driverHandler *handlers.DriverHandler, orderHandler
 	}
 }
 
-func withLogging(logger *slog.Logger, next http.Handler) http.Handler {
+func withLogging(logger *slog.Logger, enabled bool, next http.Handler) http.Handler {
+	if !enabled {
+		return next
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		logger.Info("http request", "method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
 		next.ServeHTTP(w, r)

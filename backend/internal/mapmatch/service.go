@@ -57,6 +57,12 @@ func (s *Service) Sync(ctx context.Context, raw model.DriverLocation) (model.Dri
 		s.setLatest(visible)
 		return visible, nil
 	}
+	if raw.OrderID != "" {
+		// Simulated/active-trip locations already move on a routed path; re-matching them
+		// can snap points onto neighboring lanes and make the marker "wander".
+		s.setLatest(visible)
+		return visible, nil
+	}
 
 	recent, err := s.reader.ListRecent(ctx, raw.DriverID)
 	if err != nil || len(recent) == 0 {

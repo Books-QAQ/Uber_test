@@ -15,8 +15,8 @@ import (
 )
 
 const (
-	defaultDeviationRefreshM = 20.0
-	defaultArrivalThresholdM = 45.0
+	defaultDeviationRefreshM = 60.0
+	defaultReplanCooldown    = 8 * time.Second
 )
 
 type Broadcaster interface {
@@ -38,7 +38,7 @@ type Service struct {
 	locations         LocationReader
 	planner           Planner
 	deviationRefreshM float64
-	arrivalThresholdM float64
+	replanCooldown    time.Duration
 	broadcaster       Broadcaster
 	logger            *slog.Logger
 }
@@ -54,7 +54,7 @@ func NewService(store Store, orders OrderReader, locations LocationReader, plann
 		locations:         locations,
 		planner:           planner,
 		deviationRefreshM: defaultDeviationRefreshM,
-		arrivalThresholdM: defaultArrivalThresholdM,
+		replanCooldown:    defaultReplanCooldown,
 		broadcaster:       broadcaster,
 		logger:            logger,
 	}
@@ -189,7 +189,9 @@ func (s *Service) resolveActiveOrder(ctx context.Context, locationUpdate model.D
 	if locationUpdate.OrderID != "" && s.orders != nil {
 		orderItem, err := s.orders.GetByID(ctx, locationUpdate.OrderID)
 		if err == nil {
-			return orderItem, nil
+			if orderItem.DriverID == locationUpdate.DriverID && isRouteableOrderStatus(orderItem.Status) {
+				return orderItem, nil
+			}
 		}
 		if !errors.Is(err, order.ErrNotFound) {
 			return model.Order{}, err
@@ -214,25 +216,11 @@ func (s *Service) syncRouteFor(ctx context.Context, locationUpdate model.DriverL
 		return s.ClearByDriverID(ctx, locationUpdate.DriverID)
 	}
 
-	if linearDistanceMeters(locationUpdate.Lat, locationUpdate.Lng, destination.Lat, destination.Lng) <= s.arrivalThresholdM {
-		points := dedupePoints([]model.RoutePoint{
-			{Lat: locationUpdate.Lat, Lng: locationUpdate.Lng},
-			destination,
-		})
-		_, err := s.Upsert(ctx, model.DriverRoute{
-			DriverID:  orderItem.DriverID,
-			OrderID:   orderItem.ID,
-			Mode:      mode,
-			Points:    points,
-			UpdatedAt: time.Now().UTC(),
-		})
-		return err
-	}
-
 	existing, err := s.store.GetByOrderID(ctx, orderItem.ID)
 	if err == nil && existing.DriverID == orderItem.DriverID && existing.Mode == mode {
 		if remaining := trimDrivenPath(existing.Points, model.RoutePoint{Lat: locationUpdate.Lat, Lng: locationUpdate.Lng}); len(remaining) > 0 {
-			if distanceToPathMeters(model.RoutePoint{Lat: locationUpdate.Lat, Lng: locationUpdate.Lng}, existing.Points) <= s.deviationRefreshM {
+			deviation := distanceToPathMeters(model.RoutePoint{Lat: locationUpdate.Lat, Lng: locationUpdate.Lng}, existing.Points)
+			if deviation <= s.deviationRefreshM {
 				_, err := s.Upsert(ctx, model.DriverRoute{
 					DriverID:  orderItem.DriverID,
 					OrderID:   orderItem.ID,
@@ -241,6 +229,10 @@ func (s *Service) syncRouteFor(ctx context.Context, locationUpdate model.DriverL
 					UpdatedAt: time.Now().UTC(),
 				})
 				return err
+			}
+			if s.replanCooldown > 0 && !existing.UpdatedAt.IsZero() && time.Since(existing.UpdatedAt) < s.replanCooldown {
+				s.logger.Debug("skip route replan during cooldown", "driver_id", orderItem.DriverID, "order_id", orderItem.ID, "mode", mode, "deviation_m", deviation)
+				return nil
 			}
 		}
 	} else if err != nil && !errors.Is(err, ErrNotFound) {
@@ -270,13 +262,6 @@ func (s *Service) syncRouteFor(ctx context.Context, locationUpdate model.DriverL
 }
 
 func (s *Service) planPath(ctx context.Context, originLat, originLng, destinationLat, destinationLng float64) ([]model.RoutePoint, error) {
-	if linearDistanceMeters(originLat, originLng, destinationLat, destinationLng) <= s.arrivalThresholdM {
-		return dedupePoints([]model.RoutePoint{
-			{Lat: originLat, Lng: originLng},
-			{Lat: destinationLat, Lng: destinationLng},
-		}), nil
-	}
-
 	if s.planner == nil {
 		return dedupePoints([]model.RoutePoint{
 			{Lat: originLat, Lng: originLng},
@@ -291,7 +276,14 @@ func (s *Service) planPath(ctx context.Context, originLat, originLng, destinatio
 			{Lat: destinationLat, Lng: destinationLng},
 		}), err
 	}
-	return dedupePoints(points), nil
+	points = dedupePoints(points)
+	if len(points) == 0 {
+		return dedupePoints([]model.RoutePoint{
+			{Lat: originLat, Lng: originLng},
+			{Lat: destinationLat, Lng: destinationLng},
+		}), errors.New("route planner returned empty path")
+	}
+	return points, nil
 }
 
 func routeTargetFor(orderItem model.Order) (string, model.RoutePoint, bool) {

@@ -8,6 +8,8 @@ import (
 
 type Config struct {
 	AppEnv                 string
+	LogLevel               string
+	HTTPAccessLogEnabled   bool
 	HTTPAddr               string
 	UDPAddr                string
 	AuthJWTSecret          string
@@ -44,6 +46,8 @@ type Config struct {
 func Load() Config {
 	return Config{
 		AppEnv:                 getEnv("APP_ENV", "local"),
+		LogLevel:               getEnv("LOG_LEVEL", "info"),
+		HTTPAccessLogEnabled:   getEnvBool("HTTP_ACCESS_LOG_ENABLED", false),
 		HTTPAddr:               getEnv("HTTP_ADDR", ":8080"),
 		UDPAddr:                getEnv("UDP_ADDR", ":9000"),
 		AuthJWTSecret:          getEnv("AUTH_JWT_SECRET", "dev-secret-change-me"),

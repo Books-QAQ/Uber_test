@@ -88,45 +88,45 @@ func (s *Service) HandlePacket(ctx context.Context, remoteAddr netip.AddrPort, p
 			if err := s.store.Upsert(ctx, message.Locations[0]); err != nil {
 				return err
 			}
+			broadcastLocation := s.visibleLocation(ctx, message.Locations[0])
 			if s.routeSync != nil {
-				if err := s.routeSync.SyncDriverLocation(ctx, message.Locations[0]); err != nil {
-					s.logger.Warn("sync route for driver location failed", "driver_id", message.Locations[0].DriverID, "error", err)
+				if err := s.routeSync.SyncDriverLocation(ctx, broadcastLocation); err != nil {
+					s.logger.Warn("sync route for driver location failed", "driver_id", broadcastLocation.DriverID, "error", err)
 				}
 			}
 			if s.tripRecorder != nil {
-				if err := s.tripRecorder.RecordLocation(ctx, message.Locations[0]); err != nil {
-					s.logger.Warn("record trip point failed", "driver_id", message.Locations[0].DriverID, "order_id", message.Locations[0].OrderID, "error", err)
+				if err := s.tripRecorder.RecordLocation(ctx, broadcastLocation); err != nil {
+					s.logger.Warn("record trip point failed", "driver_id", broadcastLocation.DriverID, "order_id", broadcastLocation.OrderID, "error", err)
 				}
 			}
-			broadcastLocation := s.visibleLocation(ctx, message.Locations[0])
 			s.broadcaster.BroadcastJSON(map[string]any{
 				"type": "driver.location.updated",
 				"data": broadcastLocation,
 			})
-			s.logger.Debug("processed location update packet", "driver_id", message.Locations[0].DriverID, "remote_addr", remoteAddr.String())
+			s.logger.Debug("processed location update packet", "driver_id", broadcastLocation.DriverID, "remote_addr", remoteAddr.String())
 			return nil
 		}
 
 		if err := s.store.UpsertBatch(ctx, message.Locations); err != nil {
 			return err
 		}
+		visibleBatch := make([]model.DriverLocation, 0, len(message.Locations))
+		for _, location := range message.Locations {
+			visibleBatch = append(visibleBatch, s.visibleLocation(ctx, location))
+		}
 		if s.routeSync != nil {
-			for _, location := range message.Locations {
+			for _, location := range visibleBatch {
 				if err := s.routeSync.SyncDriverLocation(ctx, location); err != nil {
 					s.logger.Warn("sync route for batch driver location failed", "driver_id", location.DriverID, "error", err)
 				}
 			}
 		}
 		if s.tripRecorder != nil {
-			for _, location := range message.Locations {
+			for _, location := range visibleBatch {
 				if err := s.tripRecorder.RecordLocation(ctx, location); err != nil {
 					s.logger.Warn("record batch trip point failed", "driver_id", location.DriverID, "order_id", location.OrderID, "error", err)
 				}
 			}
-		}
-		visibleBatch := make([]model.DriverLocation, 0, len(message.Locations))
-		for _, location := range message.Locations {
-			visibleBatch = append(visibleBatch, s.visibleLocation(ctx, location))
 		}
 		s.broadcaster.BroadcastJSON(map[string]any{
 			"type":  "driver.location.batch.updated",

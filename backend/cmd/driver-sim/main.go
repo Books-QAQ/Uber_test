@@ -26,8 +26,10 @@ import (
 )
 
 const (
-	earthRadius = 6378245.0
-	ee          = 0.00669342162296594323
+	earthRadius             = 6378245.0
+	ee                      = 0.00669342162296594323
+	locationTickInterval    = 300 * time.Millisecond
+	idleRouteSnapThresholdM = 25
 )
 
 type registerRequest struct {
@@ -92,16 +94,18 @@ type driverAgent struct {
 	activeStepM   float64
 	arriveWithinM float64
 
-	mu           sync.Mutex
-	current      *trackedOrder
-	startedAt    time.Time
-	locationSeq  int
-	currentLat   float64
-	currentLng   float64
-	idlePhase    float64
-	routeMode    string
-	routeOrderID string
-	routePath    []routePoint
+	mu            sync.Mutex
+	current       *trackedOrder
+	startedAt     time.Time
+	locationSeq   int
+	currentLat    float64
+	currentLng    float64
+	idlePhase     float64
+	routeMode     string
+	routeOrderID  string
+	routePath     []routePoint
+	routeTarget   routePoint
+	routeSyncedAt time.Time
 }
 
 type trackedOrder struct {
@@ -229,6 +233,9 @@ func (a *driverAgent) bootstrap(ctx context.Context) error {
 	if err := a.recoverActiveOrder(ctx); err != nil {
 		return err
 	}
+	if err := a.ensureIdleRoute(ctx); err != nil {
+		log.Printf("%s initial idle route setup failed: %v", a.displayName, err)
+	}
 
 	return nil
 }
@@ -291,10 +298,12 @@ func (a *driverAgent) recoverActiveOrder(ctx context.Context) error {
 }
 
 func (a *driverAgent) run(ctx context.Context) {
-	locationTicker := time.NewTicker(500 * time.Millisecond)
+	locationTicker := time.NewTicker(locationTickInterval)
 	dispatchTicker := time.NewTicker(2 * time.Second)
+	statusTicker := time.NewTicker(500 * time.Millisecond)
 	defer locationTicker.Stop()
 	defer dispatchTicker.Stop()
+	defer statusTicker.Stop()
 
 	_ = a.sendLocationUpdate(ctx)
 	for {
@@ -308,6 +317,10 @@ func (a *driverAgent) run(ctx context.Context) {
 		case <-dispatchTicker.C:
 			if err := a.syncAndDriveOrder(ctx); err != nil {
 				log.Printf("%s dispatch loop failed: %v", a.displayName, err)
+			}
+		case <-statusTicker.C:
+			if err := a.advanceCurrentOrder(ctx); err != nil {
+				log.Printf("%s order progress failed: %v", a.displayName, err)
 			}
 		}
 	}
@@ -335,6 +348,9 @@ func (a *driverAgent) syncAndDriveOrder(ctx context.Context) error {
 	}
 
 	if current == nil {
+		if err := a.ensureIdleRoute(ctx); err != nil {
+			log.Printf("%s idle route refresh failed: %v", a.displayName, err)
+		}
 		if !a.autoAccept {
 			return nil
 		}
@@ -366,29 +382,45 @@ func (a *driverAgent) syncAndDriveOrder(ctx context.Context) error {
 
 	if !a.autoProgress || tracked == nil {
 		if tracked != nil {
-			if err := a.refreshRouteFromBackend(ctx, tracked.Order); err != nil {
+			if err := a.refreshRouteIfNeeded(ctx, tracked.Order); err != nil {
 				log.Printf("%s backend route sync failed: %v", a.displayName, err)
 			}
 		}
 		return nil
 	}
 
-	if err := a.refreshRouteFromBackend(ctx, tracked.Order); err != nil {
+	if err := a.refreshRouteIfNeeded(ctx, tracked.Order); err != nil {
 		log.Printf("%s backend route sync failed: %v", a.displayName, err)
 	}
+
+	return nil
+}
+
+func (a *driverAgent) advanceCurrentOrder(ctx context.Context) error {
+	if !a.autoProgress {
+		return nil
+	}
+
+	a.mu.Lock()
+	if a.current == nil {
+		a.mu.Unlock()
+		return nil
+	}
+	tracked := *a.current
+	a.mu.Unlock()
 
 	now := time.Now().UTC()
 	switch tracked.Order.Status {
 	case model.OrderStatusAccepted:
-		if a.canAdvanceAlongRoute(tracked.Order.PickupLat, tracked.Order.PickupLng, "pickup") {
+		if now.Sub(tracked.StatusSince) >= a.arriveDelay && a.canAdvanceAlongRoute(tracked.Order.PickupLat, tracked.Order.PickupLng, "pickup") {
 			return a.progressOrder(ctx, tracked.Order.ID, model.UpdateOrderStatusInput{Status: model.OrderStatusDriverArrived}, "arrived")
 		}
 	case model.OrderStatusDriverArrived:
-		if now.Sub(tracked.StatusSince) >= a.startDelay {
+		if now.Sub(tracked.StatusSince) >= a.startDelay && a.canAdvanceAlongRoute(tracked.Order.PickupLat, tracked.Order.PickupLng, "pickup") {
 			return a.progressOrder(ctx, tracked.Order.ID, model.UpdateOrderStatusInput{Status: model.OrderStatusInTrip}, "started")
 		}
 	case model.OrderStatusInTrip:
-		if a.canAdvanceAlongRoute(tracked.Order.DestinationLat, tracked.Order.DestinationLng, "trip") {
+		if now.Sub(tracked.StatusSince) >= a.completeDelay && a.canAdvanceAlongRoute(tracked.Order.DestinationLat, tracked.Order.DestinationLng, "trip") {
 			return a.progressOrder(ctx, tracked.Order.ID, model.UpdateOrderStatusInput{
 				Status:           model.OrderStatusCompleted,
 				ActualDistanceM:  6200,
@@ -399,6 +431,120 @@ func (a *driverAgent) syncAndDriveOrder(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (a *driverAgent) refreshRouteIfNeeded(ctx context.Context, orderItem model.Order) error {
+	expectedMode := routeModeForOrderStatus(orderItem.Status)
+	if expectedMode == "" {
+		return a.refreshRouteFromBackend(ctx, orderItem)
+	}
+
+	a.mu.Lock()
+	needsRefresh := a.routeOrderID != orderItem.ID ||
+		a.routeMode != expectedMode ||
+		len(a.routePath) <= 2 ||
+		sameRoutePoint(a.routeTarget, routePoint{}) ||
+		a.routeSyncedAt.IsZero()
+	a.mu.Unlock()
+
+	if !needsRefresh {
+		return nil
+	}
+	return a.refreshRouteFromBackend(ctx, orderItem)
+}
+
+func (a *driverAgent) ensureIdleRoute(ctx context.Context) error {
+	a.mu.Lock()
+	if a.current != nil {
+		a.mu.Unlock()
+		return nil
+	}
+	currentLat := a.currentLat
+	currentLng := a.currentLng
+	routeMode := a.routeMode
+	remaining := len(a.routePath)
+	a.mu.Unlock()
+
+	if currentLat == 0 && currentLng == 0 {
+		currentLat = a.baseLat
+		currentLng = a.baseLng
+	}
+	if routeMode == "idle" && remaining > 3 {
+		return nil
+	}
+
+	destinationLat, destinationLng := a.nextIdleWaypoint()
+	route, err := a.fetchPreviewRoute(ctx, currentLat, currentLng, destinationLat, destinationLng)
+	if err != nil {
+		return err
+	}
+
+	nextPath := make([]routePoint, 0, len(route.Points))
+	for _, point := range route.Points {
+		nextPath = append(nextPath, routePoint{Lat: point.Lat, Lng: point.Lng})
+	}
+	if len(nextPath) == 0 {
+		return errors.New("idle preview route returned empty path")
+	}
+
+	snappedCurrentLat := currentLat
+	snappedCurrentLng := currentLng
+	if linearDistanceMeters(currentLat, currentLng, nextPath[0].Lat, nextPath[0].Lng) > idleRouteSnapThresholdM {
+		snappedCurrentLat = nextPath[0].Lat
+		snappedCurrentLng = nextPath[0].Lng
+	} else {
+		nextPath = trimRouteFromPosition(nextPath, routePoint{Lat: currentLat, Lng: currentLng})
+		if len(nextPath) == 0 {
+			return errors.New("idle preview route collapsed after trimming")
+		}
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.current != nil {
+		return nil
+	}
+	a.currentLat = snappedCurrentLat
+	a.currentLng = snappedCurrentLng
+	a.routeMode = "idle"
+	a.routeOrderID = ""
+	a.routePath = nextPath
+	a.routeTarget = nextPath[len(nextPath)-1]
+	return nil
+}
+
+func (a *driverAgent) nextIdleWaypoint() (float64, float64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	patrolRadius := math.Max(a.radiusMeters*0.9, 180)
+	a.idlePhase += math.Pi / 3
+	return a.baseLat + metersToLat(patrolRadius*math.Cos(a.idlePhase)),
+		a.baseLng + metersToLng(patrolRadius*math.Sin(a.idlePhase), a.baseLat)
+}
+
+func (a *driverAgent) fetchPreviewRoute(ctx context.Context, originLat, originLng, destinationLat, destinationLng float64) (model.DriverRoute, error) {
+	query := url.Values{}
+	query.Set("origin_lat", fmt.Sprintf("%.6f", originLat))
+	query.Set("origin_lng", fmt.Sprintf("%.6f", originLng))
+	query.Set("destination_lat", fmt.Sprintf("%.6f", destinationLat))
+	query.Set("destination_lng", fmt.Sprintf("%.6f", destinationLng))
+
+	status, body, err := a.doJSON(ctx, http.MethodGet, "/api/v1/routes/preview?"+query.Encode(), "", nil)
+	if err != nil {
+		return model.DriverRoute{}, err
+	}
+	if status != http.StatusOK {
+		return model.DriverRoute{}, fmt.Errorf("preview route: status=%d body=%s", status, string(body))
+	}
+
+	var result struct {
+		Item model.DriverRoute `json:"item"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return model.DriverRoute{}, fmt.Errorf("decode preview route: %w", err)
+	}
+	return result.Item, nil
 }
 
 func (a *driverAgent) progressOrder(ctx context.Context, orderID string, input model.UpdateOrderStatusInput, action string) error {
@@ -467,8 +613,7 @@ func (a *driverAgent) refreshRouteFromBackend(ctx context.Context, orderItem mod
 		return err
 	}
 	if status == http.StatusNotFound {
-		a.clearRouteState()
-		return nil
+		return a.refreshRouteFromPreview(ctx, orderItem)
 	}
 	if status != http.StatusOK {
 		return fmt.Errorf("get backend route: status=%d body=%s", status, string(body))
@@ -493,6 +638,74 @@ func (a *driverAgent) refreshRouteFromBackend(ctx context.Context, orderItem mod
 	a.routeMode = result.Item.Mode
 	a.routeOrderID = orderItem.ID
 	a.routePath = nextPath
+	if len(result.Item.Points) > 0 {
+		lastPoint := result.Item.Points[len(result.Item.Points)-1]
+		a.routeTarget = routePoint{Lat: lastPoint.Lat, Lng: lastPoint.Lng}
+	} else {
+		a.routeTarget = routePoint{}
+	}
+	a.routeSyncedAt = time.Now().UTC()
+	a.mu.Unlock()
+	return nil
+}
+
+func (a *driverAgent) refreshRouteFromPreview(ctx context.Context, orderItem model.Order) error {
+	mode := ""
+	targetLat := 0.0
+	targetLng := 0.0
+
+	switch orderItem.Status {
+	case model.OrderStatusAccepted, model.OrderStatusDriverArrived:
+		mode = "pickup"
+		targetLat = orderItem.PickupLat
+		targetLng = orderItem.PickupLng
+	case model.OrderStatusInTrip:
+		mode = "trip"
+		targetLat = orderItem.DestinationLat
+		targetLng = orderItem.DestinationLng
+	default:
+		return nil
+	}
+
+	a.mu.Lock()
+	originLat := a.currentLat
+	originLng := a.currentLng
+	a.mu.Unlock()
+	if originLat == 0 && originLng == 0 {
+		originLat = a.baseLat
+		originLng = a.baseLng
+	}
+
+	route, err := a.fetchPreviewRoute(ctx, originLat, originLng, targetLat, targetLng)
+	if err != nil {
+		return err
+	}
+
+	nextPath := make([]routePoint, 0, len(route.Points))
+	for _, point := range route.Points {
+		nextPath = append(nextPath, routePoint{Lat: point.Lat, Lng: point.Lng})
+	}
+	if len(nextPath) == 0 {
+		return errors.New("preview fallback route returned empty path")
+	}
+
+	a.mu.Lock()
+	if a.currentLat != 0 || a.currentLng != 0 {
+		nextPath = trimRouteFromPosition(nextPath, routePoint{Lat: a.currentLat, Lng: a.currentLng})
+	}
+	if len(nextPath) == 0 {
+		nextPath = []routePoint{
+			{Lat: originLat, Lng: originLng},
+			{Lat: targetLat, Lng: targetLng},
+		}
+	}
+	a.routeMode = mode
+	a.routeOrderID = orderItem.ID
+	a.routePath = nextPath
+	a.routeTarget = nextPath[len(nextPath)-1]
+	// Keep retrying the authoritative backend route on the next sync loop so the
+	// simulator quickly converges back to the same route the passenger map shows.
+	a.routeSyncedAt = time.Time{}
 	a.mu.Unlock()
 	return nil
 }
@@ -563,46 +776,55 @@ func (a *driverAgent) nextPosition() (float64, float64, float64, float64) {
 	targetLat := a.currentLat
 	targetLng := a.currentLng
 	stepM := a.idleStepM
-	speedKPH := 28.0
-	mode := "idle"
+	speedKPH := 84.0
+	mode := ""
 
 	switch {
 	case a.current == nil:
-		a.locationSeq++
-		a.idlePhase += a.speedStep
-		targetLat = a.baseLat + metersToLat(a.radiusMeters*math.Cos(a.idlePhase))
-		targetLng = a.baseLng + metersToLng(a.radiusMeters*math.Sin(a.idlePhase), a.baseLat)
+		if a.routeMode == "idle" && len(a.routePath) > 0 {
+			targetLat = a.routeTarget.Lat
+			targetLng = a.routeTarget.Lng
+			mode = "idle"
+		}
 	case a.current.Order.Status == model.OrderStatusAccepted || a.current.Order.Status == model.OrderStatusDriverArrived:
 		targetLat = a.current.Order.PickupLat
 		targetLng = a.current.Order.PickupLng
 		stepM = a.activeStepM
-		speedKPH = 42
+		speedKPH = 300
 		mode = "pickup"
 	case a.current.Order.Status == model.OrderStatusInTrip:
 		targetLat = a.current.Order.DestinationLat
 		targetLng = a.current.Order.DestinationLng
 		stepM = a.activeStepM
-		speedKPH = 48
+		speedKPH = 300
 		mode = "trip"
 	default:
-		a.locationSeq++
-		a.idlePhase += a.speedStep
-		targetLat = a.baseLat + metersToLat(a.radiusMeters*math.Cos(a.idlePhase))
-		targetLng = a.baseLng + metersToLng(a.radiusMeters*math.Sin(a.idlePhase), a.baseLat)
+		mode = ""
 	}
 
-	if mode == "idle" {
+	if mode != "" && mode != "idle" {
+		if routeTarget, ok := a.routeTargetLocked(mode); ok {
+			targetLat = routeTarget.Lat
+			targetLng = routeTarget.Lng
+		}
+	}
+	stepM = clampStepMeters(stepM, speedKPH)
+
+	if mode == "" {
 		a.routeMode = ""
 		a.routePath = nil
-		a.currentLat, a.currentLng = moveTowards(a.currentLat, a.currentLng, targetLat, targetLng, stepM)
+		a.routeTarget = routePoint{}
+		// Hold position until the next idle road route is prepared.
 	} else {
-		if linearDistanceMeters(a.currentLat, a.currentLng, targetLat, targetLng) <= a.arriveWithinM {
+		if linearDistanceMeters(a.currentLat, a.currentLng, targetLat, targetLng) <= finalSnapThresholdMeters(stepM) {
 			a.routeMode = mode
 			a.routePath = nil
 			a.currentLat = targetLat
 			a.currentLng = targetLng
 		} else if a.ensureRouteLocked(mode) {
 			a.currentLat, a.currentLng = followRoute(a.currentLat, a.currentLng, &a.routePath, stepM)
+		} else if a.routeMode == mode && a.routeOrderID == a.current.Order.ID && len(a.routePath) == 0 && !sameRoutePoint(a.routeTarget, routePoint{}) {
+			// Hold at the final routed point instead of lunging off-road toward the raw target.
 		} else {
 			a.currentLat, a.currentLng = moveTowards(a.currentLat, a.currentLng, targetLat, targetLng, stepM)
 		}
@@ -613,10 +835,32 @@ func (a *driverAgent) nextPosition() (float64, float64, float64, float64) {
 }
 
 func (a *driverAgent) ensureRouteLocked(mode string) bool {
+	if mode == "idle" {
+		return a.routeMode == "idle" && len(a.routePath) > 0
+	}
 	if a.current == nil {
 		return false
 	}
 	return a.routeMode == mode && a.routeOrderID == a.current.Order.ID && len(a.routePath) > 0
+}
+
+func (a *driverAgent) routeTargetLocked(mode string) (routePoint, bool) {
+	if mode == "idle" {
+		if a.routeMode != "idle" || sameRoutePoint(a.routeTarget, routePoint{}) {
+			return routePoint{}, false
+		}
+		return a.routeTarget, true
+	}
+	if a.current == nil {
+		return routePoint{}, false
+	}
+	if a.routeMode != mode || a.routeOrderID != a.current.Order.ID {
+		return routePoint{}, false
+	}
+	if sameRoutePoint(a.routeTarget, routePoint{}) {
+		return routePoint{}, false
+	}
+	return a.routeTarget, true
 }
 
 func (a *driverAgent) clearRouteState() {
@@ -625,6 +869,8 @@ func (a *driverAgent) clearRouteState() {
 	a.routeMode = ""
 	a.routeOrderID = ""
 	a.routePath = nil
+	a.routeTarget = routePoint{}
+	a.routeSyncedAt = time.Time{}
 }
 
 func (a *driverAgent) distanceTo(lat, lng float64) float64 {
@@ -647,19 +893,65 @@ func (a *driverAgent) canAdvanceAlongRoute(targetLat, targetLng float64, expecte
 		currentLng = a.baseLng
 	}
 
-	distance := linearDistanceMeters(currentLat, currentLng, targetLat, targetLng)
-	if distance <= a.arriveWithinM {
-		return true
+	effectiveTargetLat := targetLat
+	effectiveTargetLng := targetLng
+	if routeTarget, ok := a.routeTargetLocked(expectedMode); ok {
+		effectiveTargetLat = routeTarget.Lat
+		effectiveTargetLng = routeTarget.Lng
 	}
 
-	// When the route has been fully consumed, allow a small snap-to-finish buffer
-	// to tolerate minor map-matching and routing drift, but avoid time-based jumps.
-	routeExhaustedNearTarget := a.routeMode == expectedMode &&
-		a.routeOrderID != "" &&
-		len(a.routePath) == 0 &&
-		distance <= math.Max(a.arriveWithinM*1.5, 60)
+	directDistance := linearDistanceMeters(currentLat, currentLng, effectiveTargetLat, effectiveTargetLng)
+	if directDistance > a.arriveWithinM {
+		return false
+	}
 
-	return routeExhaustedNearTarget
+	threshold := a.advanceThresholdMeters(expectedMode)
+	remaining := a.remainingRouteDistanceLocked(currentLat, currentLng, effectiveTargetLat, effectiveTargetLng, expectedMode)
+	return remaining <= threshold
+}
+
+func (a *driverAgent) advanceThresholdMeters(mode string) float64 {
+	switch mode {
+	case "pickup":
+		return math.Min(a.arriveWithinM, 12)
+	case "trip":
+		return math.Min(a.arriveWithinM, 8)
+	default:
+		return math.Min(a.arriveWithinM, 10)
+	}
+}
+
+func (a *driverAgent) remainingRouteDistanceLocked(currentLat, currentLng, fallbackLat, fallbackLng float64, expectedMode string) float64 {
+	if a.routeMode != expectedMode {
+		return linearDistanceMeters(currentLat, currentLng, fallbackLat, fallbackLng)
+	}
+
+	if expectedMode != "idle" {
+		if a.current == nil || a.routeOrderID != a.current.Order.ID {
+			return linearDistanceMeters(currentLat, currentLng, fallbackLat, fallbackLng)
+		}
+	}
+
+	if len(a.routePath) > 0 {
+		remaining := 0.0
+		prevLat := currentLat
+		prevLng := currentLng
+		for _, point := range a.routePath {
+			remaining += linearDistanceMeters(prevLat, prevLng, point.Lat, point.Lng)
+			prevLat = point.Lat
+			prevLng = point.Lng
+		}
+		if !sameRoutePoint(a.routeTarget, routePoint{}) && !sameRoutePoint(a.routePath[len(a.routePath)-1], a.routeTarget) {
+			remaining += linearDistanceMeters(prevLat, prevLng, a.routeTarget.Lat, a.routeTarget.Lng)
+		}
+		return remaining
+	}
+
+	if !sameRoutePoint(a.routeTarget, routePoint{}) {
+		return linearDistanceMeters(currentLat, currentLng, a.routeTarget.Lat, a.routeTarget.Lng)
+	}
+
+	return linearDistanceMeters(currentLat, currentLng, fallbackLat, fallbackLng)
 }
 
 func (a *driverAgent) decodeJSON(ctx context.Context, method, path, token string, payload any, out any) error {
@@ -717,6 +1009,24 @@ func metersToLat(meters float64) float64 {
 
 func metersToLng(meters float64, lat float64) float64 {
 	return meters / (111320.0 * math.Cos(lat*math.Pi/180))
+}
+
+func clampStepMeters(configuredStepM, speedKPH float64) float64 {
+	speedBasedStep := speedKPH * 1000 / 3600 * locationTickInterval.Seconds()
+	if speedBasedStep <= 0 {
+		speedBasedStep = 1
+	}
+	if configuredStepM <= 0 {
+		return speedBasedStep
+	}
+	return math.Min(configuredStepM, speedBasedStep)
+}
+
+func finalSnapThresholdMeters(stepM float64) float64 {
+	if stepM <= 0 {
+		return 6
+	}
+	return math.Max(4, math.Min(stepM*0.8, 10))
 }
 
 func moveTowards(fromLat, fromLng, toLat, toLng, stepM float64) (float64, float64) {
@@ -815,6 +1125,38 @@ func trimRouteFromPosition(path []routePoint, current routePoint) []routePoint {
 		}
 	}
 	return dedupeRoutePoints(trimmed)
+}
+
+func dropNearCurrentPrefix(path []routePoint, current routePoint, thresholdM float64) []routePoint {
+	normalized := dedupeRoutePoints(path)
+	if len(normalized) == 0 {
+		return nil
+	}
+	if thresholdM <= 0 {
+		return normalized
+	}
+
+	index := 0
+	for index < len(normalized) && linearDistanceMeters(current.Lat, current.Lng, normalized[index].Lat, normalized[index].Lng) <= thresholdM {
+		index++
+	}
+	if index >= len(normalized) {
+		// Preserve the final routed point so the driver can finish the last short
+		// segment instead of freezing in the endpoint safety-hold branch.
+		return []routePoint{normalized[len(normalized)-1]}
+	}
+	return append([]routePoint(nil), normalized[index:]...)
+}
+
+func routeModeForOrderStatus(status string) string {
+	switch status {
+	case model.OrderStatusAccepted, model.OrderStatusDriverArrived:
+		return "pickup"
+	case model.OrderStatusInTrip:
+		return "trip"
+	default:
+		return ""
+	}
 }
 
 type projectedRoutePoint struct {

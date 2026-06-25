@@ -76,7 +76,11 @@ const selectedOrder = computed(() => {
 const isAuthenticated = computed(() => Boolean(session.token && session.user));
 const selectedOrderCanCancel = computed(() => selectedOrder.value?.status === "pending_dispatch");
 const selectedOrderCanPay = computed(() => {
-  return selectedOrder.value?.status === "to_be_paid" || selectedOrder.value?.status === "completed";
+  const order = selectedOrder.value;
+  if (!order) {
+    return false;
+  }
+  return order.status === "to_be_paid" || order.status === "completed";
 });
 const mergedDrivers = computed(() =>
   nearbyDrivers.value.map((driver) => {
@@ -94,10 +98,57 @@ const mergedDrivers = computed(() =>
     };
   }),
 );
-const mapPickupLat = computed(() => selectedOrder.value?.pickup_lat ?? orderForm.pickup_lat);
-const mapPickupLng = computed(() => selectedOrder.value?.pickup_lng ?? orderForm.pickup_lng);
-const mapDestinationLat = computed(() => selectedOrder.value?.destination_lat ?? orderForm.destination_lat);
-const mapDestinationLng = computed(() => selectedOrder.value?.destination_lng ?? orderForm.destination_lng);
+const selectedOrderRoute = computed(() => {
+  const order = selectedOrder.value;
+  if (!order) {
+    return null;
+  }
+  return liveRoutes.value[order.id] ?? null;
+});
+const selectedOrderPickupPoint = computed(() => {
+  const order = selectedOrder.value;
+  if (!order) {
+    return null;
+  }
+
+  const route = selectedOrderRoute.value;
+  if (route?.mode === "pickup" && route.points.length > 0) {
+    return route.points[route.points.length - 1];
+  }
+
+  return {
+    lat: order.pickup_lat,
+    lng: order.pickup_lng,
+  };
+});
+const selectedOrderDestinationPoint = computed(() => {
+  const order = selectedOrder.value;
+  if (!order) {
+    return null;
+  }
+
+  const route = selectedOrderRoute.value;
+  if (route?.mode === "trip" && route.points.length > 0) {
+    return route.points[route.points.length - 1];
+  }
+
+  return {
+    lat: order.destination_lat,
+    lng: order.destination_lng,
+  };
+});
+const selectedOrderRouteTarget = computed(() => {
+  const points = selectedOrderRoute.value?.points ?? [];
+  if (points.length === 0) {
+    return null;
+  }
+  return points[points.length - 1];
+});
+const displayRoute = computed(() => (selectedOrder.value ? selectedOrderRoute.value : previewRoute.value));
+const mapPickupLat = computed(() => selectedOrderPickupPoint.value?.lat ?? orderForm.pickup_lat);
+const mapPickupLng = computed(() => selectedOrderPickupPoint.value?.lng ?? orderForm.pickup_lng);
+const mapDestinationLat = computed(() => selectedOrderDestinationPoint.value?.lat ?? orderForm.destination_lat);
+const mapDestinationLng = computed(() => selectedOrderDestinationPoint.value?.lng ?? orderForm.destination_lng);
 const totalRouteDistanceM = computed(() =>
   distanceMeters(mapPickupLat.value, mapPickupLng.value, mapDestinationLat.value, mapDestinationLng.value),
 );
@@ -108,14 +159,6 @@ const estimatedOrderPrice = computed(() => calculateEstimatedFare(draftRouteDist
 const estimatedOrderPriceDisplay = computed(() =>
   estimatedOrderPrice.value === null ? "--" : formatMoney(estimatedOrderPrice.value),
 );
-const selectedOrderRoute = computed(() => {
-  const order = selectedOrder.value;
-  if (!order) {
-    return null;
-  }
-  return liveRoutes.value[order.id] ?? null;
-});
-const displayRoute = computed(() => (selectedOrder.value ? selectedOrderRoute.value : previewRoute.value));
 const routeProgressCard = computed(() => {
   const order = selectedOrder.value;
   if (!order?.driver_id) {
@@ -135,10 +178,16 @@ const routeProgressCard = computed(() => {
     };
   }
 
+  const routeTarget = selectedOrderRouteTarget.value;
+  const pickupTargetLat = routeTarget?.lat ?? order.pickup_lat;
+  const pickupTargetLng = routeTarget?.lng ?? order.pickup_lng;
+  const tripTargetLat = routeTarget?.lat ?? order.destination_lat;
+  const tripTargetLng = routeTarget?.lng ?? order.destination_lng;
+
   if (order.status === "in_trip") {
     return {
       title: "剩余路程",
-      value: formatDistance(distanceMeters(live.lat, live.lng, order.destination_lat, order.destination_lng)),
+      value: formatDistance(distanceMeters(live.lat, live.lng, tripTargetLat, tripTargetLng)),
       hint: "司机已接到乘客，正在前往目的地",
     };
   }
@@ -153,7 +202,7 @@ const routeProgressCard = computed(() => {
 
   return {
     title: "司机正在赶来",
-    value: formatDistance(distanceMeters(live.lat, live.lng, order.pickup_lat, order.pickup_lng)),
+    value: formatDistance(distanceMeters(live.lat, live.lng, pickupTargetLat, pickupTargetLng)),
     hint: "司机距上车点的当前距离",
   };
 });
@@ -261,10 +310,28 @@ watch(
 );
 
 async function bootstrapAuthedView() {
+  if (!(await ensureSessionValid())) {
+    return;
+  }
   await Promise.all([locatePassenger(true), loadOrders(), loadNearby()]);
   await loadPreviewRoute();
   connectSocket();
   startPolling();
+}
+
+async function ensureSessionValid() {
+  if (!session.token) {
+    return false;
+  }
+
+  try {
+    const result = await api<{ item: User }>("/api/v1/auth/me");
+    session.user = result.item;
+    persistSession();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function submitAuth() {
@@ -656,7 +723,7 @@ function persistSession() {
   localStorage.setItem(storageKey, JSON.stringify({ token: session.token, user: session.user }));
 }
 
-function logout() {
+function clearAuthedState() {
   draftMode.value = true;
   session.token = "";
   session.user = null;
@@ -669,6 +736,16 @@ function logout() {
   localStorage.removeItem(storageKey);
   disconnectSocket();
   stopPolling();
+  socketState.value = "idle";
+}
+
+function handleUnauthorized() {
+  clearAuthedState();
+  message.value = "登录状态已失效，请重新登录。";
+}
+
+function logout() {
+  clearAuthedState();
   message.value = "已退出登录。";
 }
 
@@ -738,6 +815,10 @@ async function api<T>(path: string, options: { method?: string; body?: unknown }
 
   const raw = await response.text();
   const data = raw ? JSON.parse(raw) : {};
+  if (response.status === 401) {
+    handleUnauthorized();
+    throw new Error(data.error ?? "登录状态已失效，请重新登录。");
+  }
   if (!response.ok) {
     throw new Error(data.error ?? `请求失败: ${response.status}`);
   }
@@ -864,7 +945,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
             <strong>{{ routeProgressCard.value }}</strong>
             <em>{{ routeProgressCard.hint }}</em>
           </article>
-          <p v-if="displayDrivers.length === 0" class="empty-hint">还没有附近司机。启动司机模拟器后这里就会热起来。</p>
         </div>
       </section>
 
