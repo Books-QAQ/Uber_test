@@ -84,6 +84,11 @@ func (s *MemoryStore) UpsertVehicle(_ context.Context, vehicle model.Vehicle) er
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	for driverID, existing := range s.vehiclesByDriver {
+		if driverID != vehicle.DriverID && existing.PlateNo == vehicle.PlateNo {
+			return ErrDuplicatePlateNo
+		}
+	}
 	s.vehiclesByDriver[vehicle.DriverID] = vehicle
 	return nil
 }

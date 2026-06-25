@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"uber-test/backend/internal/model"
+	"uber-test/backend/internal/order"
 )
 
 type stubPlanner struct {
@@ -15,6 +16,27 @@ type stubPlanner struct {
 
 func (s stubPlanner) Plan(_ context.Context, _ float64, _ float64, _ float64, _ float64) ([]model.RoutePoint, error) {
 	return append([]model.RoutePoint(nil), s.points...), s.err
+}
+
+type stubOrderReader struct {
+	activeByDriver map[string]model.Order
+}
+
+func (s stubOrderReader) GetByID(_ context.Context, id string) (model.Order, error) {
+	for _, item := range s.activeByDriver {
+		if item.ID == id {
+			return item, nil
+		}
+	}
+	return model.Order{}, order.ErrNotFound
+}
+
+func (s stubOrderReader) FindActiveByDriverID(_ context.Context, driverID string) (model.Order, error) {
+	item, ok := s.activeByDriver[driverID]
+	if !ok {
+		return model.Order{}, order.ErrNotFound
+	}
+	return item, nil
 }
 
 func TestPlanPathUsesPlannerEvenNearDestination(t *testing.T) {
@@ -144,5 +166,53 @@ func TestSyncRouteForSkipsReplanDuringCooldown(t *testing.T) {
 		if route.Points[i] != initial.Points[i] {
 			t.Fatalf("expected route point %d to stay %+v, got %+v", i, initial.Points[i], route.Points[i])
 		}
+	}
+}
+
+func TestProjectVisibleLocationSnapsToProjectedRoadPoint(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemoryStore()
+	service := NewService(store, stubOrderReader{
+		activeByDriver: map[string]model.Order{
+			"driver-1": {
+				ID:       "order-1",
+				DriverID: "driver-1",
+				Status:   model.OrderStatusAccepted,
+			},
+		},
+	}, nil, nil, nil, nil)
+
+	route := model.DriverRoute{
+		DriverID: "driver-1",
+		OrderID:  "order-1",
+		Mode:     "pickup",
+		Points: []model.RoutePoint{
+			{Lat: 31.230000, Lng: 121.470000},
+			{Lat: 31.230000, Lng: 121.470120},
+			{Lat: 31.230000, Lng: 121.470240},
+		},
+		UpdatedAt: time.Now().UTC(),
+	}
+	if err := store.Save(context.Background(), route); err != nil {
+		t.Fatalf("save route: %v", err)
+	}
+
+	raw := model.DriverLocation{
+		DriverID: "driver-1",
+		OrderID:  "order-1",
+		Lat:      31.230004,
+		Lng:      121.470002,
+	}
+
+	visible, err := service.ProjectVisibleLocation(context.Background(), raw)
+	if err != nil {
+		t.Fatalf("ProjectVisibleLocation returned error: %v", err)
+	}
+	if visible.Lat == raw.Lat && visible.Lng == raw.Lng {
+		t.Fatalf("expected visible location to snap away from raw point, got %+v", visible)
+	}
+	if visible.Lng != route.Points[1].Lng {
+		t.Fatalf("expected visible location to snap to road connector point lng %.6f, got %.6f", route.Points[1].Lng, visible.Lng)
 	}
 }

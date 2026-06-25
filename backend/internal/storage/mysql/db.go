@@ -1,12 +1,14 @@
 package mysql
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"embed"
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -68,10 +70,49 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 		if readErr != nil {
 			return fmt.Errorf("read mysql migration %s: %w", name, readErr)
 		}
-		if _, execErr := db.ExecContext(ctx, string(sqlBytes)); execErr != nil {
-			return fmt.Errorf("run mysql migration %s: %w", name, execErr)
+
+		statements := splitSQLStatements(string(sqlBytes))
+		for _, statement := range statements {
+			if _, execErr := db.ExecContext(ctx, statement); execErr != nil {
+				return fmt.Errorf("run mysql migration %s: %w", name, execErr)
+			}
 		}
 	}
 
 	return nil
+}
+
+func splitSQLStatements(sqlText string) []string {
+	scanner := bufio.NewScanner(strings.NewReader(sqlText))
+	var (
+		statements []string
+		builder    strings.Builder
+	)
+
+	flush := func() {
+		statement := strings.TrimSpace(builder.String())
+		if statement != "" {
+			statements = append(statements, statement)
+		}
+		builder.Reset()
+	}
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "--") {
+			continue
+		}
+
+		if builder.Len() > 0 {
+			builder.WriteByte('\n')
+		}
+		builder.WriteString(line)
+
+		if strings.HasSuffix(line, ";") {
+			flush()
+		}
+	}
+
+	flush()
+	return statements
 }

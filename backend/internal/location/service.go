@@ -20,6 +20,7 @@ type Broadcaster interface {
 type RouteCoordinator interface {
 	SyncDriverLocation(ctx context.Context, location model.DriverLocation) error
 	ClearByDriverID(ctx context.Context, driverID string) error
+	ProjectVisibleLocation(ctx context.Context, location model.DriverLocation) (model.DriverLocation, error)
 }
 
 type TripRecorder interface {
@@ -104,13 +105,10 @@ func (s *Service) ListLatest(ctx context.Context) ([]model.DriverLocation, error
 	if err != nil {
 		return nil, err
 	}
-	if s.matcher == nil {
-		return items, nil
-	}
 
 	visible := make([]model.DriverLocation, 0, len(items))
 	for _, item := range items {
-		visible = append(visible, s.overlayMatched(item))
+		visible = append(visible, s.overlayVisible(ctx, item))
 	}
 	return visible, nil
 }
@@ -123,7 +121,7 @@ func (s *Service) GetLatestByDriverID(ctx context.Context, driverID string) (mod
 	if err != nil {
 		return model.DriverLocation{}, err
 	}
-	return s.overlayMatched(item), nil
+	return s.overlayVisible(ctx, item), nil
 }
 
 func (s *Service) SetDriverStatus(ctx context.Context, status model.DriverStatus) error {
@@ -153,13 +151,10 @@ func (s *Service) FindNearby(ctx context.Context, query model.NearbyQuery) ([]mo
 	if err != nil {
 		return nil, err
 	}
-	if s.matcher == nil {
-		return items, nil
-	}
 
 	visible := make([]model.NearbyDriver, 0, len(items))
 	for _, item := range items {
-		item.Location = s.overlayMatched(item.Location)
+		item.Location = s.overlayVisible(ctx, item.Location)
 		visible = append(visible, item)
 	}
 	return visible, nil
@@ -206,6 +201,14 @@ func (s *Service) RunExpirationLoop(ctx context.Context, interval, inactiveTimeo
 }
 
 func (s *Service) visibleLocation(ctx context.Context, raw model.DriverLocation) model.DriverLocation {
+	if s.routeSync != nil {
+		projected, err := s.routeSync.ProjectVisibleLocation(ctx, raw)
+		if err != nil {
+			s.logger.Warn("route projection failed, falling back to matcher/raw location", "driver_id", raw.DriverID, "order_id", raw.OrderID, "error", err)
+		} else {
+			return projected
+		}
+	}
 	if s.matcher == nil {
 		return raw
 	}
@@ -232,12 +235,12 @@ func (s *Service) processLocations(ctx context.Context, locations []model.Driver
 		if err := s.store.Upsert(ctx, locations[0]); err != nil {
 			return err
 		}
-		broadcastLocation := s.visibleLocation(ctx, locations[0])
 		if s.routeSync != nil {
-			if err := s.routeSync.SyncDriverLocation(ctx, broadcastLocation); err != nil {
-				s.logger.Warn("sync route for driver location failed", "driver_id", broadcastLocation.DriverID, "error", err)
+			if err := s.routeSync.SyncDriverLocation(ctx, locations[0]); err != nil {
+				s.logger.Warn("sync route for driver location failed", "driver_id", locations[0].DriverID, "error", err)
 			}
 		}
+		broadcastLocation := s.visibleLocation(ctx, locations[0])
 		if s.tripRecorder != nil {
 			if err := s.tripRecorder.RecordLocation(ctx, broadcastLocation); err != nil {
 				s.logger.Warn("record trip point failed", "driver_id", broadcastLocation.DriverID, "order_id", broadcastLocation.OrderID, "error", err)
@@ -254,16 +257,16 @@ func (s *Service) processLocations(ctx context.Context, locations []model.Driver
 	if err := s.store.UpsertBatch(ctx, locations); err != nil {
 		return err
 	}
-	visibleBatch := make([]model.DriverLocation, 0, len(locations))
-	for _, location := range locations {
-		visibleBatch = append(visibleBatch, s.visibleLocation(ctx, location))
-	}
 	if s.routeSync != nil {
-		for _, location := range visibleBatch {
+		for _, location := range locations {
 			if err := s.routeSync.SyncDriverLocation(ctx, location); err != nil {
 				s.logger.Warn("sync route for batch driver location failed", "driver_id", location.DriverID, "error", err)
 			}
 		}
+	}
+	visibleBatch := make([]model.DriverLocation, 0, len(locations))
+	for _, location := range locations {
+		visibleBatch = append(visibleBatch, s.visibleLocation(ctx, location))
 	}
 	if s.tripRecorder != nil {
 		for _, location := range visibleBatch {
@@ -308,6 +311,17 @@ func (s *Service) overlayMatched(raw model.DriverLocation) model.DriverLocation 
 		return matched
 	}
 	return raw
+}
+
+func (s *Service) overlayVisible(ctx context.Context, raw model.DriverLocation) model.DriverLocation {
+	if s.routeSync != nil {
+		projected, err := s.routeSync.ProjectVisibleLocation(ctx, raw)
+		if err == nil {
+			return projected
+		}
+		s.logger.Warn("route projection overlay failed, falling back to matcher/raw location", "driver_id", raw.DriverID, "order_id", raw.OrderID, "error", err)
+	}
+	return s.overlayMatched(raw)
 }
 
 type decodedIngress struct {

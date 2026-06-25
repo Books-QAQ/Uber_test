@@ -35,14 +35,28 @@ func (s *MySQLStore) CreateUser(ctx context.Context, user model.User) error {
 }
 
 func (s *MySQLStore) UpsertVehicle(ctx context.Context, vehicle model.Vehicle) error {
-	_, err := s.db.ExecContext(ctx, `
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE vehicles
+		SET plate_no = ?, updated_at = ?
+		WHERE driver_id = ?
+	`, vehicle.PlateNo, vehicle.UpdatedAt, vehicle.DriverID)
+	if err != nil {
+		return normalizeVehicleError(err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected > 0 {
+		return nil
+	}
+
+	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO vehicles (id, driver_id, plate_no, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?)
-		ON DUPLICATE KEY UPDATE
-			plate_no = VALUES(plate_no),
-			updated_at = VALUES(updated_at)
 	`, vehicle.ID, vehicle.DriverID, vehicle.PlateNo, vehicle.CreatedAt, vehicle.UpdatedAt)
-	return err
+	return normalizeVehicleError(err)
 }
 
 func (s *MySQLStore) GetUserByPhone(ctx context.Context, phone string) (model.User, error) {
@@ -147,4 +161,16 @@ func nullableTime(value time.Time) any {
 		return nil
 	}
 	return value
+}
+
+func normalizeVehicleError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	var mysqlErr *drivermysql.MySQLError
+	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
+		return ErrDuplicatePlateNo
+	}
+	return err
 }

@@ -58,6 +58,14 @@ export type DriverLocation = {
   timestamp?: string;
 };
 
+export type DriverProfile = {
+  user_id: string;
+  driver_id: string;
+  display_name?: string;
+  phone: string;
+  plate_no?: string;
+};
+
 export type RoutePoint = {
   lat: number;
   lng: number;

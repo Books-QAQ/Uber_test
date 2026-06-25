@@ -17,6 +17,8 @@ import (
 const (
 	defaultDeviationRefreshM = 60.0
 	defaultReplanCooldown    = 8 * time.Second
+	visibleProjectionRawToleranceM = 12.0
+	visibleProjectionConnectorM    = 80.0
 )
 
 type Broadcaster interface {
@@ -159,6 +161,35 @@ func (s *Service) SyncDriverLocation(ctx context.Context, locationUpdate model.D
 	}
 
 	return s.syncRouteFor(ctx, locationUpdate, orderItem)
+}
+
+func (s *Service) ProjectVisibleLocation(ctx context.Context, locationUpdate model.DriverLocation) (model.DriverLocation, error) {
+	visible := locationUpdate
+	if s == nil || s.store == nil || locationUpdate.DriverID == "" {
+		return visible, nil
+	}
+
+	route, err := s.routeForVisibleProjection(ctx, locationUpdate)
+	if err != nil {
+		return visible, err
+	}
+	if len(route.Points) == 0 {
+		return visible, nil
+	}
+
+	path := projectionPathForVisibleLocation(route.Points, locationUpdate)
+	if len(path) == 0 {
+		return visible, nil
+	}
+
+	projected, ok := projectPointToPath(model.RoutePoint{Lat: locationUpdate.Lat, Lng: locationUpdate.Lng}, path)
+	if !ok {
+		return visible, nil
+	}
+
+	visible.Lat = projected.Lat
+	visible.Lng = projected.Lng
+	return visible, nil
 }
 
 func (s *Service) SyncOrder(ctx context.Context, orderItem model.Order) error {
@@ -400,4 +431,79 @@ func linearDistanceMeters(fromLat, fromLng, toLat, toLng float64) float64 {
 	midLatRad := ((fromLat + toLat) / 2) * math.Pi / 180
 	lngMeters := (toLng - fromLng) * 111320.0 * math.Cos(midLatRad)
 	return math.Hypot(latMeters, lngMeters)
+}
+
+func (s *Service) routeForVisibleProjection(ctx context.Context, locationUpdate model.DriverLocation) (model.DriverRoute, error) {
+	if locationUpdate.OrderID != "" {
+		route, err := s.store.GetByOrderID(ctx, locationUpdate.OrderID)
+		if err == nil {
+			return route, nil
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return model.DriverRoute{}, err
+		}
+	}
+
+	if s.orders == nil {
+		return model.DriverRoute{}, nil
+	}
+
+	orderItem, err := s.orders.FindActiveByDriverID(ctx, locationUpdate.DriverID)
+	if err != nil {
+		if errors.Is(err, order.ErrNotFound) {
+			return model.DriverRoute{}, nil
+		}
+		return model.DriverRoute{}, err
+	}
+	if orderItem.ID == "" || !isRouteableOrderStatus(orderItem.Status) {
+		return model.DriverRoute{}, nil
+	}
+
+	route, err := s.store.GetByOrderID(ctx, orderItem.ID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return model.DriverRoute{}, nil
+		}
+		return model.DriverRoute{}, err
+	}
+	return route, nil
+}
+
+func projectionPathForVisibleLocation(points []model.RoutePoint, raw model.DriverLocation) []model.RoutePoint {
+	normalized := dedupePoints(points)
+	if len(normalized) <= 1 {
+		return normalized
+	}
+
+	if linearDistanceMeters(raw.Lat, raw.Lng, normalized[0].Lat, normalized[0].Lng) > visibleProjectionRawToleranceM {
+		return normalized
+	}
+
+	firstSegmentDistance := linearDistanceMeters(normalized[0].Lat, normalized[0].Lng, normalized[1].Lat, normalized[1].Lng)
+	if firstSegmentDistance > visibleProjectionConnectorM {
+		return normalized
+	}
+
+	return normalized[1:]
+}
+
+func projectPointToPath(point model.RoutePoint, path []model.RoutePoint) (model.RoutePoint, bool) {
+	normalized := dedupePoints(path)
+	if len(normalized) == 0 {
+		return model.RoutePoint{}, false
+	}
+	if len(normalized) == 1 {
+		return normalized[0], true
+	}
+
+	best := math.MaxFloat64
+	nearest := normalized[0]
+	for index := 0; index < len(normalized)-1; index++ {
+		projection := projectPointToSegment(point, normalized[index], normalized[index+1])
+		if projection.distance < best {
+			best = projection.distance
+			nearest = projection.point
+		}
+	}
+	return nearest, true
 }

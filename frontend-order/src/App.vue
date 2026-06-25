@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 
 import DriverMap from "./components/DriverMap.vue";
@@ -15,6 +15,7 @@ import {
 import type {
   DispatchAssignment,
   DriverLocation,
+  DriverProfile,
   DriverRoute,
   LoginResult,
   Order,
@@ -27,12 +28,16 @@ const movementTickMs = 400;
 const heartbeatTickMs = 5000;
 const syncTickMs = 2000;
 const idleSnapThresholdM = 25;
+const gpsUploadMinIntervalMs = 1000;
 
 const authMode = ref<"login" | "register">("login");
 const savingAuth = ref(false);
 const busy = ref(false);
 const mapReady = ref(false);
-const message = ref("司机调试台已就绪。车辆会自动沿路线移动，但接单、到达、乘客上车、送达完成需要你手动确认。");
+const locationSource = ref<"simulation" | "gps">("simulation");
+const gpsState = ref<"idle" | "requesting" | "active" | "error" | "unsupported">("idle");
+const gpsLastFixAt = ref("");
+const message = ref("司机调试台已就绪。车辆会自动沿路线移动，但接单、到达上车点、乘客上车和送达需要你手动确认。");
 
 const session = reactive<{
   token: string;
@@ -46,11 +51,11 @@ const authForm = reactive({
   phone: "13900000001",
   password: "pass123456",
   display_name: "Driver Debug",
-  plate_no: "沪A90001",
+  plate_no: "",
 });
 
 const driverConfig = reactive({
-  plate_no: "沪A90001",
+  plate_no: "",
   base_lat: 31.2304,
   base_lng: 121.4737,
   idle_radius_m: 600,
@@ -81,6 +86,11 @@ const selectedDispatchId = ref("");
 let movementTimer: number | null = null;
 let heartbeatTimer: number | null = null;
 let syncTimer: number | null = null;
+let gpsWatchID: number | null = null;
+let gpsUploadInFlight = false;
+let gpsUploadPending = false;
+let gpsLastUploadAt = 0;
+let gpsUploadTimer: number | null = null;
 
 const isAuthenticated = computed(() => Boolean(session.token && session.user?.driver_id));
 const driverID = computed(() => session.user?.driver_id ?? "");
@@ -162,6 +172,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  stopGPSWatch();
   stopLoops();
 });
 
@@ -170,12 +181,20 @@ async function bootstrapDriver() {
     return;
   }
 
-  driverConfig.plate_no = authForm.plate_no = driverConfig.plate_no || authForm.plate_no;
-  await upsertVehicle();
+  await hydrateDriverProfile();
   await setDriverStatus("online");
   await hydrateDriverLocation();
   await syncDriverState();
   startLoops();
+}
+
+async function hydrateDriverProfile() {
+  if (!driverID.value) {
+    return;
+  }
+
+  const result = await api<{ item: DriverProfile }>(`/api/v1/drivers/${driverID.value}/vehicle`);
+  driverConfig.plate_no = result.item.plate_no ?? "";
 }
 
 async function ensureSessionValid() {
@@ -223,7 +242,6 @@ async function submitAuth() {
 
     session.token = result.item.token;
     session.user = result.item.user;
-    driverConfig.plate_no = authForm.plate_no;
     persistSession();
     message.value = `司机 ${result.item.user.phone} 已登录，正在进入手动调试模式。`;
     await bootstrapDriver();
@@ -412,7 +430,12 @@ async function ensureIdleRoute() {
 }
 
 async function movementTick() {
-  if (!isAuthenticated.value || !driverLocation.value || runtime.driver_status === "offline") {
+  if (
+    locationSource.value !== "simulation"
+    || !isAuthenticated.value
+    || !driverLocation.value
+    || runtime.driver_status === "offline"
+  ) {
     return;
   }
 
@@ -453,6 +476,147 @@ async function movementTick() {
 
   if (!currentOrder.value && movementPath.value.length === 0) {
     await ensureIdleRoute();
+  }
+}
+
+function useSimulationLocation() {
+  stopGPSWatch();
+  locationSource.value = "simulation";
+  runtime.movement_mode = currentOrder.value?.status ?? "idle";
+  message.value = "已切换为模拟行驶，车辆将继续沿规划路线自动移动。";
+}
+
+function useGPSLocation() {
+  if (!("geolocation" in navigator)) {
+    gpsState.value = "unsupported";
+    message.value = "当前浏览器不支持 GPS 定位。";
+    return;
+  }
+  if (!isAuthenticated.value) {
+    message.value = "请先登录司机账号，再启用 GPS 定位。";
+    return;
+  }
+
+  stopGPSWatch();
+  locationSource.value = "gps";
+  gpsState.value = "requesting";
+  runtime.movement_mode = "gps_waiting";
+  message.value = "正在申请 GPS 定位权限，请在浏览器中允许访问位置。";
+
+  gpsWatchID = navigator.geolocation.watchPosition(
+    handleGPSPosition,
+    handleGPSError,
+    {
+      enableHighAccuracy: true,
+      maximumAge: 1000,
+      timeout: 15000,
+    },
+  );
+}
+
+function stopGPSWatch() {
+  if (gpsWatchID !== null && "geolocation" in navigator) {
+    navigator.geolocation.clearWatch(gpsWatchID);
+  }
+  gpsWatchID = null;
+  if (gpsUploadTimer !== null) {
+    window.clearTimeout(gpsUploadTimer);
+    gpsUploadTimer = null;
+  }
+  gpsUploadPending = false;
+  gpsUploadInFlight = false;
+  if (gpsState.value !== "unsupported") {
+    gpsState.value = "idle";
+  }
+}
+
+function handleGPSPosition(position: GeolocationPosition) {
+  if (locationSource.value !== "gps" || !driverID.value) {
+    return;
+  }
+
+  const lat = position.coords.latitude;
+  const lng = position.coords.longitude;
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return;
+  }
+
+  const previous = driverLocation.value;
+  const traveledM = previous ? distanceMeters(previous.lat, previous.lng, lat, lng) : 0;
+  const timestamp = new Date(position.timestamp).toISOString();
+  const heading = position.coords.heading ?? (
+    previous && traveledM > 0.5
+      ? bearingDegrees(previous.lat, previous.lng, lat, lng)
+      : previous?.heading ?? 0
+  );
+
+  driverLocation.value = {
+    driver_id: driverID.value,
+    order_id: currentOrder.value?.id,
+    lat,
+    lng,
+    heading,
+    speed_kph: Math.max(0, (position.coords.speed ?? 0) * 3.6),
+    accuracy_m: position.coords.accuracy,
+    timestamp,
+  };
+  gpsState.value = "active";
+  gpsLastFixAt.value = timestamp;
+  runtime.movement_mode = currentOrder.value?.status ?? "gps";
+
+  if (currentOrder.value?.status === "in_trip" && traveledM < 500) {
+    runtime.trip_distance_m += traveledM;
+  }
+
+  scheduleGPSUpload();
+}
+
+function handleGPSError(error: GeolocationPositionError) {
+  gpsState.value = "error";
+  const reason = error.code === error.PERMISSION_DENIED
+    ? "定位权限被拒绝"
+    : error.code === error.POSITION_UNAVAILABLE
+      ? "暂时无法获取位置"
+      : "获取位置超时";
+  message.value = `GPS 定位失败：${reason}。`;
+}
+
+function scheduleGPSUpload() {
+  if (gpsUploadInFlight) {
+    gpsUploadPending = true;
+    return;
+  }
+
+  const waitMs = Math.max(0, gpsUploadMinIntervalMs - (Date.now() - gpsLastUploadAt));
+  if (waitMs > 0) {
+    if (gpsUploadTimer === null) {
+      gpsUploadTimer = window.setTimeout(() => {
+        gpsUploadTimer = null;
+        void uploadGPSLocation();
+      }, waitMs);
+    }
+    return;
+  }
+  void uploadGPSLocation();
+}
+
+async function uploadGPSLocation() {
+  if (locationSource.value !== "gps" || !driverLocation.value || runtime.driver_status === "offline") {
+    return;
+  }
+
+  gpsUploadInFlight = true;
+  gpsUploadPending = false;
+  try {
+    await pushLocationUpdate();
+    gpsLastUploadAt = Date.now();
+  } catch (error) {
+    message.value = `GPS 位置上报失败：${asErrorMessage(error)}`;
+  } finally {
+    gpsUploadInFlight = false;
+    if (gpsUploadPending) {
+      scheduleGPSUpload();
+    }
   }
 }
 
@@ -503,7 +667,7 @@ async function setDriverStatus(status: string) {
       body: { status },
     });
     runtime.driver_status = status;
-    message.value = `司机状态已切换到 ${status}。`;
+    message.value = `司机状态已切换为 ${status}。`;
   } catch (error) {
     message.value = asErrorMessage(error);
   } finally {
@@ -666,6 +830,7 @@ function restoreSession() {
 }
 
 function logout() {
+  stopGPSWatch();
   stopLoops();
   session.token = "";
   session.user = null;
@@ -676,6 +841,8 @@ function logout() {
   idleRoute.value = null;
   movementPath.value = [];
   routeTarget.value = null;
+  locationSource.value = "simulation";
+  gpsLastFixAt.value = "";
   runtime.driver_status = "offline";
   localStorage.removeItem(storageKey);
   message.value = "已退出司机调试台。";
@@ -735,7 +902,6 @@ function formatMoney(value?: number) {
     <header class="hero">
       <div class="hero-brand">
         <h1>Driver Debug 调试台</h1>
-        <p>自动行驶由前端模拟，手动控制接单、到达上车点、确认乘客上车和送达，适合逐步调试司机链路。</p>
       </div>
 
       <div class="hero-nav">
@@ -749,7 +915,7 @@ function formatMoney(value?: number) {
             <input v-model="authForm.phone" placeholder="手机号" />
             <input v-if="authMode === 'register'" v-model="authForm.display_name" placeholder="司机昵称" />
             <input v-model="authForm.password" type="password" placeholder="密码" />
-            <input v-model="authForm.plate_no" placeholder="车牌号" />
+            <input v-if="authMode === 'register'" v-model="authForm.plate_no" placeholder="车牌号" />
             <button class="primary inline-auth-submit" :disabled="savingAuth" @click="submitAuth">
               {{ savingAuth ? "提交中..." : authMode === "login" ? "登录司机端" : "注册并登录" }}
             </button>
@@ -787,6 +953,22 @@ function formatMoney(value?: number) {
               </div>
             </div>
             <div class="actions">
+              <div class="toggle location-source-toggle" aria-label="定位来源">
+                <button
+                  :class="{ active: locationSource === 'simulation' }"
+                  :disabled="!isAuthenticated"
+                  @click="useSimulationLocation"
+                >
+                  模拟行驶
+                </button>
+                <button
+                  :class="{ active: locationSource === 'gps' }"
+                  :disabled="!isAuthenticated"
+                  @click="useGPSLocation"
+                >
+                  GPS 定位
+                </button>
+              </div>
               <button class="secondary" :disabled="!isAuthenticated || busy" @click="syncDriverState">刷新司机状态</button>
               <button class="secondary" :disabled="!isAuthenticated || busy" @click="setDriverStatus('online')">上线</button>
               <button class="ghost" :disabled="!isAuthenticated || busy" @click="setDriverStatus('offline')">下线</button>
@@ -811,22 +993,23 @@ function formatMoney(value?: number) {
           <article class="metric-card">
             <span>司机状态</span>
             <strong>{{ runtime.driver_status }}</strong>
-            <em>后端司机状态标签</em>
           </article>
           <article class="metric-card">
-            <span>移动模式</span>
+            <span>当前状态</span>
             <strong>{{ runtime.movement_mode }}</strong>
-            <em>idle / accepted / driver_arrived / in_trip</em>
+          </article>
+          <article class="metric-card">
+            <span>定位来源</span>
+            <strong>{{ locationSource === "gps" ? `GPS · ${gpsState}` : "模拟行驶" }}</strong>
+            <em v-if="gpsLastFixAt">最近定位 {{ new Date(gpsLastFixAt).toLocaleTimeString() }}</em>
           </article>
           <article class="metric-card">
             <span>距上车点</span>
             <strong>{{ distanceToPickup }}</strong>
-            <em>用于判断接客进度</em>
           </article>
           <article class="metric-card">
             <span>距目的地</span>
             <strong>{{ distanceToDestination }}</strong>
-            <em>用于判断送达进度</em>
           </article>
         </div>
       </section>
@@ -886,32 +1069,34 @@ function formatMoney(value?: number) {
               :class="{ active: selectedDispatchId === assignment.dispatch.id }"
               @click="selectedDispatchId = assignment.dispatch.id"
             >
-              <div class="dispatch-inline-field">
-                <span class="dispatch-inline-label">上车点</span>
-                <strong class="dispatch-inline-value">{{ assignment.order.pickup_address || "未填写上车点" }}</strong>
-              </div>
-              <div class="dispatch-inline-field">
-                <span class="dispatch-inline-label">目的地</span>
-                <strong class="dispatch-inline-value">{{ assignment.order.destination_address || "未填写目的地" }}</strong>
-              </div>
-              <div class="dispatch-inline-field">
-                <span class="dispatch-inline-label">预估价</span>
-                <strong class="dispatch-inline-value">{{ formatMoney(assignment.order.estimated_price) }}</strong>
-              </div>
-              <div class="dispatch-inline-field">
-                <span class="dispatch-inline-label">总路程</span>
-                <strong class="dispatch-inline-value">
-                  {{
-                    formatDistance(
-                      distanceMeters(
-                        assignment.order.pickup_lat,
-                        assignment.order.pickup_lng,
-                        assignment.order.destination_lat,
-                        assignment.order.destination_lng,
-                      ),
-                    )
-                  }}
-                </strong>
+              <div class="dispatch-card-grid">
+                <div class="dispatch-card-row">
+                  <span class="dispatch-card-label">上车点</span>
+                  <strong>{{ assignment.order.pickup_address || "未填写上车点" }}</strong>
+                </div>
+                <div class="dispatch-card-row">
+                  <span class="dispatch-card-label">目的地</span>
+                  <strong>{{ assignment.order.destination_address || "未填写目的地" }}</strong>
+                </div>
+                <div class="dispatch-card-row">
+                  <span class="dispatch-card-label">预估价</span>
+                  <strong>{{ formatMoney(assignment.order.estimated_price) }}</strong>
+                </div>
+                <div class="dispatch-card-row">
+                  <span class="dispatch-card-label">总路程</span>
+                  <strong>
+                    {{
+                      formatDistance(
+                        distanceMeters(
+                          assignment.order.pickup_lat,
+                          assignment.order.pickup_lng,
+                          assignment.order.destination_lat,
+                          assignment.order.destination_lng,
+                        ),
+                      )
+                    }}
+                  </strong>
+                </div>
               </div>
             </button>
           </div>
@@ -923,7 +1108,7 @@ function formatMoney(value?: number) {
           :disabled="!selectedDispatch || !!currentOrder || busy"
           @click="selectedDispatch && acceptDispatch(selectedDispatch)"
         >
-          手动接收当前派单
+          确认接收当前派单
         </button>
       </section>
 
@@ -1152,9 +1337,13 @@ function formatMoney(value?: number) {
 
 .metrics {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 12px;
   margin-top: 18px;
+}
+
+.location-source-toggle {
+  flex: 0 0 auto;
 }
 
 .metric-card {
@@ -1291,12 +1480,9 @@ input:focus {
 }
 
 .list-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  align-items: center;
-  gap: 10px 18px;
+  display: block;
   width: 100%;
-  padding: 14px 16px;
+  padding: 16px 18px;
   border-radius: 18px;
   border: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.68);
@@ -1308,35 +1494,37 @@ input:focus {
   background: rgba(242, 107, 58, 0.1);
 }
 
-.dispatch-inline-field {
+.dispatch-card-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 32px;
+}
+
+.dispatch-card-row {
   display: flex;
   align-items: baseline;
   gap: 10px;
   min-width: 0;
 }
 
-.dispatch-inline-label {
+.dispatch-card-label {
   flex: 0 0 auto;
   color: var(--ink);
   font-size: 15px;
+  line-height: 1.25;
   font-weight: 700;
-  line-height: 1.2;
 }
 
-.dispatch-inline-value {
+.dispatch-card-row strong {
+  flex: 1 1 auto;
   min-width: 0;
-  color: var(--ink);
   font-size: 15px;
-  font-weight: 700;
-  line-height: 1.2;
-  word-break: break-word;
-}
-
-@media (max-width: 900px) {
-  .list-row {
-    grid-template-columns: 1fr;
-    align-items: start;
-  }
+  line-height: 1.25;
+  font-weight: 600;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .badge {
@@ -1384,7 +1572,8 @@ input:focus {
 
   .metrics,
   .detail-grid,
-  .pair {
+  .pair,
+  .dispatch-card-grid {
     grid-template-columns: 1fr;
   }
 

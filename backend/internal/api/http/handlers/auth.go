@@ -33,7 +33,7 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 	user, err := h.authService.Register(r.Context(), req)
 	if err != nil {
 		status := http.StatusBadRequest
-		if errors.Is(err, auth.ErrDuplicatePhone) {
+		if errors.Is(err, auth.ErrDuplicatePhone) || errors.Is(err, auth.ErrDuplicatePlateNo) {
 			status = http.StatusConflict
 		}
 		writeJSON(w, status, map[string]any{"error": err.Error()})

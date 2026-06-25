@@ -47,6 +47,33 @@ func (s *stubMatcher) GetLatest(driverID string) (model.DriverLocation, bool) {
 	return item, ok
 }
 
+type stubRouteCoordinator struct {
+	synced    []model.DriverLocation
+	projected map[string]model.DriverLocation
+}
+
+func (s *stubRouteCoordinator) SyncDriverLocation(_ context.Context, location model.DriverLocation) error {
+	s.synced = append(s.synced, location)
+	return nil
+}
+
+func (s *stubRouteCoordinator) ClearByDriverID(_ context.Context, _ string) error {
+	return nil
+}
+
+func (s *stubRouteCoordinator) ProjectVisibleLocation(_ context.Context, location model.DriverLocation) (model.DriverLocation, error) {
+	if s.projected == nil {
+		return location, nil
+	}
+	if item, ok := s.projected[location.DriverID]; ok {
+		projected := location
+		projected.Lat = item.Lat
+		projected.Lng = item.Lng
+		return projected, nil
+	}
+	return location, nil
+}
+
 func TestServiceHandlePacketSupportsBatchAndHeartbeat(t *testing.T) {
 	t.Parallel()
 
@@ -241,6 +268,51 @@ func TestServiceBroadcastsAndReadsMatchedLocations(t *testing.T) {
 	}
 	if data.Lat <= 31.2304 || data.Lng <= 121.4737 {
 		t.Fatalf("expected broadcast to use matched coordinates, got %+v", data)
+	}
+}
+
+func TestServiceSyncsRawLocationButBroadcastsProjectedVisibleLocation(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemoryStore(10)
+	broadcaster := &stubBroadcaster{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := NewService(store, broadcaster, logger)
+
+	routeCoordinator := &stubRouteCoordinator{
+		projected: map[string]model.DriverLocation{
+			"driver-route": {
+				Lat: 31.2309,
+				Lng: 121.4742,
+			},
+		},
+	}
+	service.SetRouteCoordinator(routeCoordinator)
+
+	raw := model.DriverLocation{
+		DriverID:  "driver-route",
+		OrderID:   "order-1",
+		Lat:       31.2304,
+		Lng:       121.4737,
+		Timestamp: time.Date(2026, 6, 25, 1, 0, 0, 0, time.UTC),
+	}
+	if err := service.UpsertDriverLocation(context.Background(), raw); err != nil {
+		t.Fatalf("UpsertDriverLocation returned error: %v", err)
+	}
+
+	if len(routeCoordinator.synced) != 1 {
+		t.Fatalf("expected 1 raw sync call, got %d", len(routeCoordinator.synced))
+	}
+	if routeCoordinator.synced[0].Lat != raw.Lat || routeCoordinator.synced[0].Lng != raw.Lng {
+		t.Fatalf("expected route sync to use raw location %+v, got %+v", raw, routeCoordinator.synced[0])
+	}
+
+	data, ok := broadcaster.payloads[len(broadcaster.payloads)-1]["data"].(model.DriverLocation)
+	if !ok {
+		t.Fatalf("expected broadcast payload data to be model.DriverLocation")
+	}
+	if data.Lat != 31.2309 || data.Lng != 121.4742 {
+		t.Fatalf("expected broadcast to use projected visible location, got %+v", data)
 	}
 }
 

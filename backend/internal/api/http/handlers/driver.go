@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -82,7 +83,7 @@ func (h *DriverHandler) SetStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *DriverHandler) SetVehicle(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{
 			"error": "method not allowed",
 		})
@@ -109,6 +110,20 @@ func (h *DriverHandler) SetVehicle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.Method == http.MethodGet {
+		profile, err := h.authService.GetDriverProfileByDriverID(r.Context(), driverID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"item": profile,
+		})
+		return
+	}
+
 	var req setDriverVehicleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
@@ -117,7 +132,11 @@ func (h *DriverHandler) SetVehicle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.authService.UpsertDriverVehicle(r.Context(), driverID, req.PlateNo); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
+		status := http.StatusBadRequest
+		if errors.Is(err, auth.ErrDuplicatePlateNo) {
+			status = http.StatusConflict
+		}
+		writeJSON(w, status, map[string]any{
 			"error": err.Error(),
 		})
 		return
