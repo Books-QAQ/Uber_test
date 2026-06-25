@@ -144,6 +144,8 @@ const selectedOrderRouteTarget = computed(() => {
   }
   return points[points.length - 1];
 });
+const selectedOrderPickupSummary = computed(() => selectedOrder.value?.pickup_address || "未填写上车点地址");
+const selectedOrderDestinationSummary = computed(() => selectedOrder.value?.destination_address || "未填写目的地地址");
 const displayRoute = computed(() => (selectedOrder.value ? selectedOrderRoute.value : previewRoute.value));
 const mapPickupLat = computed(() => selectedOrderPickupPoint.value?.lat ?? orderForm.pickup_lat);
 const mapPickupLng = computed(() => selectedOrderPickupPoint.value?.lng ?? orderForm.pickup_lng);
@@ -760,21 +762,23 @@ function selectOrder(orderID: string) {
   selectedOrderId.value = orderID;
 }
 
-function onMapPicked(payload: { mode: "pickup" | "destination"; lat: number; lng: number }) {
+function onMapPicked(payload: { mode: "pickup" | "destination"; lat: number; lng: number; address: string }) {
   startDraftOrder();
 
   if (payload.mode === "pickup") {
     orderForm.pickup_lat = Number(payload.lat.toFixed(6));
     orderForm.pickup_lng = Number(payload.lng.toFixed(6));
+    orderForm.pickup_address = payload.address || orderForm.pickup_address;
     nearbyForm.lat = orderForm.pickup_lat;
     nearbyForm.lng = orderForm.pickup_lng;
-    message.value = `已通过地图选择上车点 (${orderForm.pickup_lat.toFixed(4)}, ${orderForm.pickup_lng.toFixed(4)})。`;
+    message.value = `已通过地图选择上车点：${orderForm.pickup_address}。`;
     return;
   }
 
   orderForm.destination_lat = Number(payload.lat.toFixed(6));
   orderForm.destination_lng = Number(payload.lng.toFixed(6));
-  message.value = `已通过地图选择目的地 (${orderForm.destination_lat.toFixed(4)}, ${orderForm.destination_lng.toFixed(4)})。`;
+  orderForm.destination_address = payload.address || orderForm.destination_address;
+  message.value = `已通过地图选择目的地：${orderForm.destination_address}。`;
 }
 
 function formatMoney(value?: number) {
@@ -1041,7 +1045,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
           <div class="detail-summary">
             <span class="badge">{{ selectedOrder.status }}</span>
             <strong>{{ selectedOrder.id }}</strong>
-            <p>{{ selectedOrder.pickup_address || "未填写地址" }} -> {{ selectedOrder.destination_address || "未填写地址" }}</p>
+            <p>{{ selectedOrderPickupSummary }} -> {{ selectedOrderDestinationSummary }}</p>
           </div>
 
           <dl class="detail-grid">
@@ -1452,6 +1456,10 @@ input:focus {
 .order-list {
   display: grid;
   gap: 10px;
+  max-height: 560px;
+  overflow-y: auto;
+  padding-right: 6px;
+  overscroll-behavior: contain;
 }
 
 .order-row {

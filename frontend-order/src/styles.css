@@ -1,0 +1,42 @@
+:root {
+  color-scheme: light;
+  font-family: "Space Grotesk", "Avenir Next", "Segoe UI", sans-serif;
+  --bg: #f6efe4;
+  --panel: rgba(255, 252, 247, 0.9);
+  --panel-strong: #fff9f1;
+  --ink: #1f2933;
+  --muted: #5e6c76;
+  --accent: #f26b3a;
+  --accent-deep: #bd4a21;
+  --accent-soft: rgba(242, 107, 58, 0.14);
+  --line: rgba(31, 41, 51, 0.12);
+  --ok: #1f8f63;
+  --warn: #c98a16;
+  --shadow: 0 24px 60px rgba(71, 49, 30, 0.12);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at top left, rgba(242, 107, 58, 0.2), transparent 26%),
+    radial-gradient(circle at top right, rgba(56, 130, 246, 0.14), transparent 22%),
+    linear-gradient(180deg, #fcf6eb 0%, #f4ebdf 100%);
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+  border: 0;
+}

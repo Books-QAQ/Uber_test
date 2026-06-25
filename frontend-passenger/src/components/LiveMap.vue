@@ -8,6 +8,7 @@ type MapClickPayload = {
   mode: "pickup" | "destination";
   lat: number;
   lng: number;
+  address: string;
 };
 
 const props = defineProps<{
@@ -46,6 +47,7 @@ let driverMarkers = new Map<string, any>();
 let clickHandler: ((event: any) => void) | null = null;
 let lastFitAt = 0;
 let pendingFitTimer: number | null = null;
+let geocoder: any = null;
 
 const mergedDrivers = computed(() =>
   props.drivers.map((driver) => {
@@ -83,7 +85,7 @@ onMounted(async () => {
     AMap = await AMapLoader.load({
       key: amapKey,
       version: "2.0",
-      plugins: ["AMap.Scale", "AMap.ToolBar", "AMap.MoveAnimation"],
+      plugins: ["AMap.Scale", "AMap.ToolBar", "AMap.MoveAnimation", "AMap.Geocoder"],
     });
 
     if (!mapHost.value) {
@@ -109,11 +111,21 @@ onMounted(async () => {
       }),
     );
 
+    geocoder = new AMap.Geocoder({
+      radius: 1000,
+      extensions: "all",
+    });
+
     clickHandler = (event: any) => {
-      emit("pick-location", {
-        mode: props.pickMode,
-        lat: event.lnglat.getLat(),
-        lng: event.lnglat.getLng(),
+      const lat = event.lnglat.getLat();
+      const lng = event.lnglat.getLng();
+      reverseGeocode(lng, lat).then((address) => {
+        emit("pick-location", {
+          mode: props.pickMode,
+          lat,
+          lng,
+          address,
+        });
       });
     };
     map.on("click", clickHandler);
@@ -319,6 +331,31 @@ function scheduleFitView() {
     pendingFitTimer = null;
     fitView();
   }, remaining);
+}
+
+function reverseGeocode(lng: number, lat: number): Promise<string> {
+  return new Promise((resolve) => {
+    if (!geocoder) {
+      resolve(formatFallbackAddress(lat, lng));
+      return;
+    }
+
+    geocoder.getAddress([lng, lat], (status: string, result: any) => {
+      if (status !== "complete" || !result?.regeocode) {
+        resolve(formatFallbackAddress(lat, lng));
+        return;
+      }
+
+      const poiName = result.regeocode.pois?.[0]?.name?.trim?.();
+      const aoiName = result.regeocode.aois?.[0]?.name?.trim?.();
+      const formatted = result.regeocode.formattedAddress?.trim?.();
+      resolve(poiName || aoiName || formatted || formatFallbackAddress(lat, lng));
+    });
+  });
+}
+
+function formatFallbackAddress(lat: number, lng: number) {
+  return `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
 }
 
 function badgeHTML(text: string, color: string) {

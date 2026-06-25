@@ -129,6 +129,77 @@ func TestServiceEnsureDriverCanAcceptAndMarkAccepted(t *testing.T) {
 	}
 }
 
+func TestServiceListPendingAssignmentsSkipsInactiveOrders(t *testing.T) {
+	t.Parallel()
+
+	service, orderStore := newTestService(t)
+	now := time.Now().UTC()
+
+	activeOrder := model.Order{
+		ID:             "order-active",
+		PassengerID:    "passenger-active",
+		Status:         model.OrderStatusPendingDispatch,
+		PickupLat:      31.2304,
+		PickupLng:      121.4737,
+		DestinationLat: 31.2204,
+		DestinationLng: 121.4637,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	completedOrder := model.Order{
+		ID:             "order-completed",
+		PassengerID:    "passenger-completed",
+		Status:         model.OrderStatusCompleted,
+		PickupLat:      31.2304,
+		PickupLng:      121.4737,
+		DestinationLat: 31.2204,
+		DestinationLng: 121.4637,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	for _, item := range []model.Order{activeOrder, completedOrder} {
+		if err := orderStore.Create(context.Background(), item); err != nil {
+			t.Fatalf("seed order %s: %v", item.ID, err)
+		}
+	}
+
+	if err := service.store.CreateBatch(context.Background(), []model.DispatchRecord{
+		{
+			ID:            "dispatch-active",
+			OrderID:       activeOrder.ID,
+			DriverID:      "driver-near-1",
+			Status:        model.DispatchStatusPending,
+			DistanceM:     120,
+			DispatchRound: 1,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		},
+		{
+			ID:            "dispatch-completed",
+			OrderID:       completedOrder.ID,
+			DriverID:      "driver-near-1",
+			Status:        model.DispatchStatusPending,
+			DistanceM:     180,
+			DispatchRound: 1,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		},
+	}); err != nil {
+		t.Fatalf("seed dispatch records: %v", err)
+	}
+
+	assignments, err := service.ListPendingAssignmentsByDriverID(context.Background(), "driver-near-1")
+	if err != nil {
+		t.Fatalf("list pending assignments: %v", err)
+	}
+	if len(assignments) != 1 {
+		t.Fatalf("expected only 1 active assignment, got %d", len(assignments))
+	}
+	if assignments[0].Order.ID != activeOrder.ID {
+		t.Fatalf("expected active order %s, got %s", activeOrder.ID, assignments[0].Order.ID)
+	}
+}
+
 func TestServiceClosePendingByDriverID(t *testing.T) {
 	t.Parallel()
 

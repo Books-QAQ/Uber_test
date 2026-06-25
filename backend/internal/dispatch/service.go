@@ -131,6 +131,9 @@ func (s *Service) ListPendingAssignmentsByDriverID(ctx context.Context, driverID
 				continue
 			}
 			order = found
+			if order.Status != model.OrderStatusPendingDispatch {
+				continue
+			}
 		}
 		assignments = append(assignments, model.DispatchAssignment{
 			Dispatch: record,

@@ -56,7 +56,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 	mux.HandleFunc("/api/v1/auth/login", authHandler.Login)
 	mux.HandleFunc("/api/v1/routes/preview", routeHandler.GetPreview)
 	mux.Handle("/api/v1/auth/me", requireAuth(http.HandlerFunc(authHandler.Me)))
-	mux.Handle("/api/v1/drivers/", requireAuth(middleware.RequireRoles(model.RoleDriver, model.RoleAdmin)(http.HandlerFunc(routeDriverSubresources(driverHandler, orderHandler, dispatchHandler, routeHandler)))))
+	mux.Handle("/api/v1/drivers/", requireAuth(middleware.RequireRoles(model.RoleDriver, model.RoleAdmin)(http.HandlerFunc(routeDriverSubresources(driverHandler, locationHandler, orderHandler, dispatchHandler, routeHandler)))))
 	mux.Handle("/api/v1/drivers/nearby", requireAuth(middleware.RequireRoles(model.RolePassenger, model.RoleDriver, model.RoleAdmin)(http.HandlerFunc(driverHandler.ListNearby))))
 	mux.Handle("/api/v1/drivers/locations", requireAuth(middleware.RequireRoles(model.RoleAdmin)(http.HandlerFunc(locationHandler.ListLatest))))
 	mux.Handle("/api/v1/orders", requireAuth(middleware.RequireRoles(model.RolePassenger, model.RoleDriver, model.RoleAdmin)(http.HandlerFunc(routeOrderCollection(orderHandler)))))
@@ -82,13 +82,19 @@ func routeOrderCollection(handler *handlers.OrderHandler) http.HandlerFunc {
 	}
 }
 
-func routeDriverSubresources(driverHandler *handlers.DriverHandler, orderHandler *handlers.OrderHandler, dispatchHandler *handlers.DispatchHandler, routeHandler *handlers.RouteHandler) http.HandlerFunc {
+func routeDriverSubresources(driverHandler *handlers.DriverHandler, locationHandler *handlers.LocationHandler, orderHandler *handlers.OrderHandler, dispatchHandler *handlers.DispatchHandler, routeHandler *handlers.RouteHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/status"):
 			driverHandler.SetStatus(w, r)
 		case strings.HasSuffix(r.URL.Path, "/vehicle"):
 			driverHandler.SetVehicle(w, r)
+		case strings.HasSuffix(r.URL.Path, "/location") && r.Method == http.MethodGet:
+			locationHandler.GetLatestByDriver(w, r)
+		case strings.HasSuffix(r.URL.Path, "/location"):
+			locationHandler.UpsertByDriver(w, r)
+		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+			locationHandler.TouchHeartbeatByDriver(w, r)
 		case strings.HasSuffix(r.URL.Path, "/current-order"):
 			orderHandler.GetCurrentByDriver(w, r)
 		case strings.HasSuffix(r.URL.Path, "/dispatches"):

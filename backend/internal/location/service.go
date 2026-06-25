@@ -77,82 +77,26 @@ func (s *Service) HandlePacket(ctx context.Context, remoteAddr netip.AddrPort, p
 
 	switch {
 	case len(message.Locations) > 0:
-		for i := range message.Locations {
-			if message.Locations[i].Timestamp.IsZero() {
-				message.Locations[i].Timestamp = time.Now().UTC()
-			}
-			message.Locations[i].SourceAddr = remoteAddr.String()
-		}
-
-		if len(message.Locations) == 1 {
-			if err := s.store.Upsert(ctx, message.Locations[0]); err != nil {
-				return err
-			}
-			broadcastLocation := s.visibleLocation(ctx, message.Locations[0])
-			if s.routeSync != nil {
-				if err := s.routeSync.SyncDriverLocation(ctx, broadcastLocation); err != nil {
-					s.logger.Warn("sync route for driver location failed", "driver_id", broadcastLocation.DriverID, "error", err)
-				}
-			}
-			if s.tripRecorder != nil {
-				if err := s.tripRecorder.RecordLocation(ctx, broadcastLocation); err != nil {
-					s.logger.Warn("record trip point failed", "driver_id", broadcastLocation.DriverID, "order_id", broadcastLocation.OrderID, "error", err)
-				}
-			}
-			s.broadcaster.BroadcastJSON(map[string]any{
-				"type": "driver.location.updated",
-				"data": broadcastLocation,
-			})
-			s.logger.Debug("processed location update packet", "driver_id", broadcastLocation.DriverID, "remote_addr", remoteAddr.String())
-			return nil
-		}
-
-		if err := s.store.UpsertBatch(ctx, message.Locations); err != nil {
-			return err
-		}
-		visibleBatch := make([]model.DriverLocation, 0, len(message.Locations))
-		for _, location := range message.Locations {
-			visibleBatch = append(visibleBatch, s.visibleLocation(ctx, location))
-		}
-		if s.routeSync != nil {
-			for _, location := range visibleBatch {
-				if err := s.routeSync.SyncDriverLocation(ctx, location); err != nil {
-					s.logger.Warn("sync route for batch driver location failed", "driver_id", location.DriverID, "error", err)
-				}
-			}
-		}
-		if s.tripRecorder != nil {
-			for _, location := range visibleBatch {
-				if err := s.tripRecorder.RecordLocation(ctx, location); err != nil {
-					s.logger.Warn("record batch trip point failed", "driver_id", location.DriverID, "order_id", location.OrderID, "error", err)
-				}
-			}
-		}
-		s.broadcaster.BroadcastJSON(map[string]any{
-			"type":  "driver.location.batch.updated",
-			"count": len(message.Locations),
-			"data":  visibleBatch,
-		})
-		s.logger.Debug("processed location batch packet", "count", len(message.Locations), "remote_addr", remoteAddr.String())
-		return nil
+		return s.processLocations(ctx, message.Locations, remoteAddr.String())
 	case message.Heartbeat != nil:
-		if message.Heartbeat.Timestamp.IsZero() {
-			message.Heartbeat.Timestamp = time.Now().UTC()
-		}
-		message.Heartbeat.SourceAddr = remoteAddr.String()
-
-		if err := s.store.TouchHeartbeat(ctx, *message.Heartbeat); err != nil {
-			return err
-		}
-		s.broadcaster.BroadcastJSON(map[string]any{
-			"type": "driver.heartbeat.received",
-			"data": message.Heartbeat,
-		})
-		s.logger.Debug("processed heartbeat packet", "driver_id", message.Heartbeat.DriverID, "remote_addr", remoteAddr.String())
-		return nil
+		return s.processHeartbeat(ctx, *message.Heartbeat, remoteAddr.String())
 	default:
 		return fmt.Errorf("decoded location packet is empty")
 	}
+}
+
+func (s *Service) UpsertDriverLocation(ctx context.Context, location model.DriverLocation) error {
+	if location.DriverID == "" {
+		return fmt.Errorf("upsert driver location: missing driver_id")
+	}
+	return s.processLocations(ctx, []model.DriverLocation{location}, "http-debug")
+}
+
+func (s *Service) TouchHeartbeat(ctx context.Context, heartbeat model.DriverHeartbeat) error {
+	if heartbeat.DriverID == "" {
+		return fmt.Errorf("touch driver heartbeat: missing driver_id")
+	}
+	return s.processHeartbeat(ctx, heartbeat, "http-debug")
 }
 
 func (s *Service) ListLatest(ctx context.Context) ([]model.DriverLocation, error) {
@@ -272,6 +216,88 @@ func (s *Service) visibleLocation(ctx context.Context, raw model.DriverLocation)
 		return raw
 	}
 	return matched
+}
+
+func (s *Service) processLocations(ctx context.Context, locations []model.DriverLocation, sourceAddr string) error {
+	for i := range locations {
+		if locations[i].Timestamp.IsZero() {
+			locations[i].Timestamp = time.Now().UTC()
+		}
+		if locations[i].SourceAddr == "" {
+			locations[i].SourceAddr = sourceAddr
+		}
+	}
+
+	if len(locations) == 1 {
+		if err := s.store.Upsert(ctx, locations[0]); err != nil {
+			return err
+		}
+		broadcastLocation := s.visibleLocation(ctx, locations[0])
+		if s.routeSync != nil {
+			if err := s.routeSync.SyncDriverLocation(ctx, broadcastLocation); err != nil {
+				s.logger.Warn("sync route for driver location failed", "driver_id", broadcastLocation.DriverID, "error", err)
+			}
+		}
+		if s.tripRecorder != nil {
+			if err := s.tripRecorder.RecordLocation(ctx, broadcastLocation); err != nil {
+				s.logger.Warn("record trip point failed", "driver_id", broadcastLocation.DriverID, "order_id", broadcastLocation.OrderID, "error", err)
+			}
+		}
+		s.broadcaster.BroadcastJSON(map[string]any{
+			"type": "driver.location.updated",
+			"data": broadcastLocation,
+		})
+		s.logger.Debug("processed location update", "driver_id", broadcastLocation.DriverID, "source_addr", locations[0].SourceAddr)
+		return nil
+	}
+
+	if err := s.store.UpsertBatch(ctx, locations); err != nil {
+		return err
+	}
+	visibleBatch := make([]model.DriverLocation, 0, len(locations))
+	for _, location := range locations {
+		visibleBatch = append(visibleBatch, s.visibleLocation(ctx, location))
+	}
+	if s.routeSync != nil {
+		for _, location := range visibleBatch {
+			if err := s.routeSync.SyncDriverLocation(ctx, location); err != nil {
+				s.logger.Warn("sync route for batch driver location failed", "driver_id", location.DriverID, "error", err)
+			}
+		}
+	}
+	if s.tripRecorder != nil {
+		for _, location := range visibleBatch {
+			if err := s.tripRecorder.RecordLocation(ctx, location); err != nil {
+				s.logger.Warn("record batch trip point failed", "driver_id", location.DriverID, "order_id", location.OrderID, "error", err)
+			}
+		}
+	}
+	s.broadcaster.BroadcastJSON(map[string]any{
+		"type":  "driver.location.batch.updated",
+		"count": len(locations),
+		"data":  visibleBatch,
+	})
+	s.logger.Debug("processed location batch update", "count", len(locations), "source_addr", sourceAddr)
+	return nil
+}
+
+func (s *Service) processHeartbeat(ctx context.Context, heartbeat model.DriverHeartbeat, sourceAddr string) error {
+	if heartbeat.Timestamp.IsZero() {
+		heartbeat.Timestamp = time.Now().UTC()
+	}
+	if heartbeat.SourceAddr == "" {
+		heartbeat.SourceAddr = sourceAddr
+	}
+
+	if err := s.store.TouchHeartbeat(ctx, heartbeat); err != nil {
+		return err
+	}
+	s.broadcaster.BroadcastJSON(map[string]any{
+		"type": "driver.heartbeat.received",
+		"data": heartbeat,
+	})
+	s.logger.Debug("processed heartbeat update", "driver_id", heartbeat.DriverID, "source_addr", heartbeat.SourceAddr)
+	return nil
 }
 
 func (s *Service) overlayMatched(raw model.DriverLocation) model.DriverLocation {
