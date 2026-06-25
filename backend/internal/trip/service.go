@@ -12,11 +12,20 @@ import (
 )
 
 type Service struct {
-	store Store
+	store       Store
+	broadcaster Broadcaster
+}
+
+type Broadcaster interface {
+	BroadcastJSON(v any)
 }
 
 func NewService(store Store) *Service {
 	return &Service{store: store}
+}
+
+func (s *Service) SetBroadcaster(broadcaster Broadcaster) {
+	s.broadcaster = broadcaster
 }
 
 func (s *Service) SyncWithOrder(ctx context.Context, order model.Order, input model.UpdateOrderStatusInput) (model.Trip, error) {
@@ -49,6 +58,11 @@ func (s *Service) SyncWithOrder(ctx context.Context, order model.Order, input mo
 		if trip.StartedAt.IsZero() {
 			trip.StartedAt = time.Now().UTC()
 		}
+		trip.FinalPrice = calculateCurrentFare(
+			trip.ActualDistanceM,
+			trip.ActualDurationS,
+			trip.WaitingDurationS,
+		)
 	case model.OrderStatusCompleted, model.OrderStatusToBePaid, model.OrderStatusPaid:
 		if trip.StartedAt.IsZero() {
 			trip.StartedAt = order.UpdatedAt
@@ -66,6 +80,9 @@ func (s *Service) SyncWithOrder(ctx context.Context, order model.Order, input mo
 
 	if err := s.store.Save(ctx, trip); err != nil {
 		return model.Trip{}, err
+	}
+	if trip.Status == model.TripStatusInTrip || trip.Status == model.TripStatusCompleted || trip.Status == model.TripStatusPaid {
+		s.broadcastFareUpdate(trip)
 	}
 
 	return trip, nil
@@ -151,8 +168,17 @@ func (s *Service) RecordLocation(ctx context.Context, location model.DriverLocat
 	if !trip.StartedAt.IsZero() {
 		trip.ActualDurationS = maxInt(trip.ActualDurationS, int(recordedAt.Sub(trip.StartedAt).Seconds()))
 	}
+	trip.FinalPrice = calculateCurrentFare(
+		trip.ActualDistanceM,
+		trip.ActualDurationS,
+		trip.WaitingDurationS,
+	)
 	trip.UpdatedAt = now
-	return s.store.Save(ctx, trip)
+	if err := s.store.Save(ctx, trip); err != nil {
+		return err
+	}
+	s.broadcastFareUpdate(trip)
+	return nil
 }
 
 func calculateFare(order model.Order, input model.UpdateOrderStatusInput, trip model.Trip) float64 {
@@ -163,22 +189,45 @@ func calculateFare(order model.Order, input model.UpdateOrderStatusInput, trip m
 		return order.FinalPrice
 	}
 
-	distanceKM := float64(maxInt(input.ActualDistanceM, trip.ActualDistanceM)) / 1000.0
-	durationMin := float64(maxInt(input.ActualDurationS, trip.ActualDurationS)) / 60.0
-	waitingMin := float64(maxInt(input.WaitingDurationS, trip.WaitingDurationS)) / 60.0
+	return calculateCurrentFare(
+		maxInt(input.ActualDistanceM, trip.ActualDistanceM),
+		maxInt(input.ActualDurationS, trip.ActualDurationS),
+		maxInt(input.WaitingDurationS, trip.WaitingDurationS),
+	)
+}
+
+func calculateCurrentFare(actualDistanceM, actualDurationS, waitingDurationS int) float64 {
+	distanceKM := float64(actualDistanceM) / 1000.0
+	durationMin := float64(actualDurationS) / 60.0
+	waitingMin := float64(waitingDurationS) / 60.0
 
 	if distanceKM == 0 && durationMin == 0 && waitingMin == 0 {
-		if order.EstimatedPrice > 0 {
-			return order.EstimatedPrice
-		}
-		return 14
+		return 0
 	}
 
-	total := 14.0 + distanceKM*2.8 + durationMin*0.5 + waitingMin*0.8
-	if total < order.EstimatedPrice {
-		return order.EstimatedPrice
-	}
+	total := distanceKM*10.2 + durationMin*0.5 + waitingMin*0.8
 	return roundTo2(total)
+}
+
+func (s *Service) broadcastFareUpdate(trip model.Trip) {
+	if s.broadcaster == nil {
+		return
+	}
+
+	s.broadcaster.BroadcastJSON(map[string]any{
+		"type": "trip.fare.updated",
+		"data": map[string]any{
+			"trip_id":            trip.ID,
+			"order_id":           trip.OrderID,
+			"driver_id":          trip.DriverID,
+			"status":             trip.Status,
+			"actual_distance_m":  trip.ActualDistanceM,
+			"actual_duration_s":  trip.ActualDurationS,
+			"waiting_duration_s": trip.WaitingDurationS,
+			"current_price":      trip.FinalPrice,
+			"updated_at":         trip.UpdatedAt,
+		},
+	})
 }
 
 func newTripID() string {

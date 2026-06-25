@@ -20,6 +20,7 @@ import type {
   LoginResult,
   Order,
   RoutePoint,
+  SocketEvent,
   User,
 } from "./types";
 
@@ -37,6 +38,8 @@ const mapReady = ref(false);
 const locationSource = ref<"simulation" | "gps">("simulation");
 const gpsState = ref<"idle" | "requesting" | "active" | "error" | "unsupported">("idle");
 const gpsLastFixAt = ref("");
+const liveFareByOrder = ref<Record<string, number>>({});
+const ws = ref<WebSocket | null>(null);
 const message = ref("司机调试台已就绪。车辆会自动沿路线移动，但接单、到达上车点、乘客上车和送达需要你手动确认。");
 
 const session = reactive<{
@@ -99,6 +102,13 @@ const selectedDispatch = computed(
 );
 const focusOrder = computed(() => currentOrder.value ?? selectedDispatch.value?.order ?? null);
 const displayRoute = computed(() => (currentOrder.value ? activeRoute.value : idleRoute.value));
+const currentOrderPrice = computed(() => {
+  const order = currentOrder.value;
+  if (!order) {
+    return undefined;
+  }
+  return liveFareByOrder.value[order.id] ?? order.final_price ?? 0;
+});
 const currentOrderPickupPoint = computed(() => {
   const order = currentOrder.value;
   if (!order) {
@@ -172,6 +182,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  disconnectSocket();
   stopGPSWatch();
   stopLoops();
 });
@@ -185,7 +196,54 @@ async function bootstrapDriver() {
   await setDriverStatus("online");
   await hydrateDriverLocation();
   await syncDriverState();
+  connectSocket();
   startLoops();
+}
+
+function connectSocket() {
+  if (!session.token || ws.value?.readyState === WebSocket.OPEN) {
+    return;
+  }
+
+  disconnectSocket();
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  const socket = new WebSocket(
+    `${protocol}://${window.location.host}/ws/location?token=${encodeURIComponent(session.token)}`,
+  );
+  ws.value = socket;
+  socket.onmessage = (event) => {
+    try {
+      handleSocketEvent(JSON.parse(event.data) as SocketEvent);
+    } catch {
+      // Ignore non-JSON debug messages.
+    }
+  };
+  socket.onclose = () => {
+    if (ws.value === socket) {
+      ws.value = null;
+    }
+  };
+}
+
+function disconnectSocket() {
+  ws.value?.close();
+  ws.value = null;
+}
+
+function handleSocketEvent(event: SocketEvent) {
+  if (event.type !== "trip.fare.updated" || !isRecord(event.data)) {
+    return;
+  }
+
+  const orderID = String(event.data.order_id ?? "");
+  const currentPrice = Number(event.data.current_price ?? 0);
+  if (!orderID || !Number.isFinite(currentPrice) || currentPrice < 0) {
+    return;
+  }
+  liveFareByOrder.value = {
+    ...liveFareByOrder.value,
+    [orderID]: currentPrice,
+  };
 }
 
 async function hydrateDriverProfile() {
@@ -830,6 +888,7 @@ function restoreSession() {
 }
 
 function logout() {
+  disconnectSocket();
   stopGPSWatch();
   stopLoops();
   session.token = "";
@@ -843,6 +902,7 @@ function logout() {
   routeTarget.value = null;
   locationSource.value = "simulation";
   gpsLastFixAt.value = "";
+  liveFareByOrder.value = {};
   runtime.driver_status = "offline";
   localStorage.removeItem(storageKey);
   message.value = "已退出司机调试台。";
@@ -890,10 +950,14 @@ function formatDistance(distanceM: number) {
 }
 
 function formatMoney(value?: number) {
-  if (!value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
     return "-";
   }
   return `¥${value.toFixed(2)}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 </script>
 
@@ -1131,8 +1195,8 @@ function formatMoney(value?: number) {
                 <dd>{{ currentOrder.passenger_id }}</dd>
               </div>
               <div>
-                <dt>路线模式</dt>
-                <dd>{{ activeRoute?.mode || "-" }}</dd>
+                <dt>实时价格</dt>
+                <dd>{{ formatMoney(currentOrderPrice) }}</dd>
               </div>
               <div>
                 <dt>预估价</dt>

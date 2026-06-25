@@ -26,6 +26,7 @@ const selectedOrderId = ref("");
 const socketEvents = ref<Array<{ id: number; text: string }>>([]);
 const liveDriverLocations = ref<Record<string, DriverLiveLocation>>({});
 const liveRoutes = ref<Record<string, DriverRoute>>({});
+const liveFareByOrder = ref<Record<string, number>>({});
 const previewRoute = ref<DriverRoute | null>(null);
 const ws = ref<WebSocket | null>(null);
 let pollTimer: number | null = null;
@@ -81,6 +82,13 @@ const selectedOrderCanPay = computed(() => {
     return false;
   }
   return order.status === "to_be_paid" || order.status === "completed";
+});
+const selectedOrderCurrentPrice = computed(() => {
+  const order = selectedOrder.value;
+  if (!order) {
+    return undefined;
+  }
+  return liveFareByOrder.value[order.id] ?? order.final_price ?? 0;
 });
 const mergedDrivers = computed(() =>
   nearbyDrivers.value.map((driver) => {
@@ -606,6 +614,17 @@ function stopPolling() {
 function handleSocketEvent(event: SocketEvent) {
   pushEvent(formatSocketEvent(event));
 
+  if (event.type === "trip.fare.updated" && isRecord(event.data)) {
+    const orderId = String(event.data.order_id ?? "");
+    const currentPrice = Number(event.data.current_price ?? 0);
+    if (orderId && Number.isFinite(currentPrice) && currentPrice >= 0) {
+      liveFareByOrder.value = {
+        ...liveFareByOrder.value,
+        [orderId]: currentPrice,
+      };
+    }
+  }
+
   if (event.type === "driver.location.updated" && isRecord(event.data)) {
     const driverId = String(event.data.driver_id ?? "");
     if (driverId) {
@@ -803,6 +822,9 @@ function formatSocketEvent(event: SocketEvent) {
   }
   if (event.type === "driver.heartbeat.received" && isRecord(event.data)) {
     return `司机 ${event.data.driver_id ?? "-"} 心跳到达`;
+  }
+  if (event.type === "trip.fare.updated" && isRecord(event.data)) {
+    return `订单 ${event.data.order_id ?? "-"} 实时价格更新为 ${formatMoney(Number(event.data.current_price ?? 0))}`;
   }
   return JSON.stringify(event);
 }
@@ -1062,8 +1084,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
               <dd>{{ formatMoney(selectedOrder.estimated_price) }}</dd>
             </div>
             <div>
-              <dt>最终价</dt>
-              <dd>{{ formatMoney(selectedOrder.final_price) }}</dd>
+              <dt>实时价格</dt>
+              <dd>{{ formatMoney(selectedOrderCurrentPrice) }}</dd>
             </div>
             <div>
               <dt>更新时间</dt>

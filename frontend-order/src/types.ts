@@ -78,3 +78,8 @@ export type DriverRoute = {
   points: RoutePoint[];
   updated_at: string;
 };
+
+export type SocketEvent = {
+  type?: string;
+  data?: unknown;
+};

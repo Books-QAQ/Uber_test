@@ -118,6 +118,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		logger.Info("osrm map match enabled", "osrm_base_url", cfg.RouteOSRMBaseURL, "min_points", cfg.MapMatchMinPoints, "window_size", cfg.MapMatchWindowSize, "max_lookback", cfg.MapMatchMaxLookback)
 	}
 	tripService := trip.NewService(tripStore)
+	tripService.SetBroadcaster(hub)
 	routePlanner := routeplan.NewHTTPPlanner(routeplan.PlannerConfig{
 		AMapWebKey:     cfg.RouteAMapWebKey,
 		OSRMBaseURL:    cfg.RouteOSRMBaseURL,
@@ -131,18 +132,18 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	orderService.SetRouteCoordinator(routeService)
 
 	router := httpapi.NewRouter(httpapi.RouterDeps{
-		Logger:          logger,
+		Logger:           logger,
 		AccessLogEnabled: cfg.HTTPAccessLogEnabled,
-		AuthService:     authService,
-		Authenticator:   authenticator,
-		LocationService: locationService,
-		OrderService:    orderService,
-		TripService:     tripService,
-		DispatchService: dispatchService,
-		RouteService:    routeService,
-		Hub:             hub,
-		WSReadBuffer:    cfg.WSReadBuffer,
-		WSWriteBuffer:   cfg.WSWriteBuffer,
+		AuthService:      authService,
+		Authenticator:    authenticator,
+		LocationService:  locationService,
+		OrderService:     orderService,
+		TripService:      tripService,
+		DispatchService:  dispatchService,
+		RouteService:     routeService,
+		Hub:              hub,
+		WSReadBuffer:     cfg.WSReadBuffer,
+		WSWriteBuffer:    cfg.WSWriteBuffer,
 	})
 
 	return &App{
